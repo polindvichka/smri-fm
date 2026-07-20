@@ -28,46 +28,45 @@ output_dir: checkpoints/experiments
 r2_sync: null
 
 # img_size doubles as the local_pt_dataset random-crop size. 160cube matches
-# the ResEncUNet-B/U-Net-B asparagus crop size, and (more importantly) is
-# the threshold local_pt_dataset filters volumes by so crops are always 100%
-# real content, never padded -- see src/data/local_pt_dataset.py's docstring
-# and the sibling ToMe experiment's README for why (82% of scans were mostly
-# zero-padding at the original full-volume 208x240x208 approach). 131/965
-# files across the whole dataset pass the filter at 160cube.
+# the ResEncUNet-B/U-Net-B asparagus crop size, fixing the resolution
+# mismatch vs. the original full 208x240x208 approach.
+#
+# Note on data quality: ~83% of this dataset's 965 files fill <30% of any
+# reasonable fixed crop (checked at both 208x240x208 and 160cube -- barely
+# changes with target size), since a meaningful chunk (all 139 DWI/perfusion
+# files, plus many undersized anat scans) are inherently thin-slice
+# sequences, not full 3D volumes -- a property of this dataset, not fixable
+# by a smarter crop. Kept all 965 anyway rather than filtering to ~131
+# "clean" files, to preserve ~1000-scan comparability with the
+# ResEncUNet-B/U-Net-B/Primus-S checkpoints this is meant to be comparable
+# to. Not a training-correctness problem: img_mask already excludes
+# padded/invalid voxels from both context and loss (see
+# MaskedAutoencoderViT.prepare_masks in the sibling smri_mae package) --
+# low-fill files just contribute less signal per sample. See
+# src/data/local_pt_dataset.py's module docstring and the sibling ToMe
+# experiment's README for the full accounting.
 img_size: [160, 160, 160]
 
-# asparagus's precomputed split_99_01_00.json assumes ~all files are usable,
-# which badly breaks down once local_pt_dataset filters by crop-size fit --
-# its 10-file val split had only 1 file survive. local_pt_source points both
-# fomo_train and fomo_val at the same full pool (paths.json, all 975 files);
-# create_local_data_loaders filters once and splits the *usable* 131 itself
-# (local_pt_val_fraction below), so both sides end up non-trivially sized.
-local_pt_source: /workspace/fomo26/processed_data/PT902_FOMO300K_HF/paths.json
-local_pt_val_fraction: 0.1
-
-# ~118 usable train files (131 usable x 90%) x epochs, still targeting ~15k
-# gradient steps (effective batch 16 -> ~7 steps/epoch -> epochs is large
-# mainly because "epoch" is now a much smaller unit, not because training
-# runs longer in wall-clock terms).
-epochs: 2150
-warmup_epochs: 215
+epochs: 250
+warmup_epochs: 25
 
 wandb: true
 wandb_entity: palinaskipar-zdro-tech
 wandb_project: smri-fm-edgeloss
 
-# Same local .pt data source/split logic as the ToMe experiment -- same
-# subset, same seed, so results are comparable across both experiments too.
-# datasets.*.paths is ignored when local_pt_source (above) is set -- kept
-# here only so `format: local_pt` still selects the local-file code path.
+# All 965/10 files from asparagus's own split (fold 0) -- see the img_size
+# comment above for why nothing is filtered out here. Same split as the
+# sibling ToMe experiment, so results are comparable across both.
 datasets:
   fomo_train:
     format: local_pt
+    paths: /workspace/fomo26/processed_data/PT902_FOMO300K_HF/split_99_01_00.json#train
     shuffle: true
     drop_last: true
 
   fomo_val:
     format: local_pt
+    paths: /workspace/fomo26/processed_data/PT902_FOMO300K_HF/split_99_01_00.json#val
     shuffle: false
     drop_last: false
 
