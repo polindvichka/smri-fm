@@ -28,48 +28,46 @@ r2_sync: null
 
 # img_size doubles as the local_pt_dataset random-crop size (see
 # src/data/local_pt_dataset.py). 160cube matches the crop size your
-# ResEncUNet-B/U-Net-B asparagus runs used -- also fixes the resolution
-# mismatch flagged earlier, and (more importantly) volumes must have every
-# spatial dim >= this to be usable at all without padding: at the original
-# 208x240x208 full-volume approach, 82% of scans were mostly zero-padding
-# (every DWI/perfusion file included), silently wasting most of the training
-# budget. At 160cube, 131/965 files across the whole dataset pass the filter
-# -- all real content, no padding. See the module docstring and
-# experiments/tome_pretrain/README.md for the full accounting.
+# ResEncUNet-B/U-Net-B asparagus runs used, and also fixes the resolution
+# mismatch flagged earlier vs. the original full 208x240x208 volumes.
+#
+# Note on data quality: ~83% of this dataset's 965 files fill <30% of any
+# reasonable fixed crop (checked at both 208x240x208 and 160cube -- barely
+# changes with target size), because a meaningful chunk of them (all 139
+# DWI/perfusion files, plus many undersized anat scans) are inherently
+# thin-slice sequences, not full 3D anatomical volumes. That's a property of
+# this specific dataset, not fixable by choosing a smarter crop -- so rather
+# than filtering those files out (which would cut the dataset to ~131 files,
+# losing the ~1000-scan comparability with the ResEncUNet-B/U-Net-B/Primus-S
+# checkpoints this is meant to be comparable to), all 965 files are kept.
+# This is not a training-*correctness* problem regardless: img_mask already
+# excludes padded/invalid voxels from both context and loss (see
+# MaskedAutoencoderViT.prepare_masks) -- low-fill files just contribute less
+# signal per sample, and ToMe merges less on them since there's less real
+# content to merge, not incorrectly. See src/data/local_pt_dataset.py's
+# module docstring and experiments/tome_pretrain/README.md for the full
+# accounting including the filtered-131-file alternative.
 img_size: [160, 160, 160]
 
-# asparagus's precomputed split_99_01_00.json assumes ~all files are usable,
-# which badly breaks down once local_pt_dataset filters by crop-size fit --
-# its 10-file val split had only 1 file survive. local_pt_source points both
-# fomo_train and fomo_val at the same full pool (paths.json, all 975 files);
-# create_local_data_loaders filters once and splits the *usable* 131 itself
-# (local_pt_val_fraction below), so both sides end up non-trivially sized.
-local_pt_source: /workspace/fomo26/processed_data/PT902_FOMO300K_HF/paths.json
-local_pt_val_fraction: 0.1
-
-# ~118 usable train files (131 usable x 90%) x epochs. Still targeting ~15k
-# gradient steps to match the asparagus runs' step count -- at effective
-# batch 16, that's ~7 optimizer steps per epoch, so epochs is large mostly
-# because "epoch" is now a much smaller unit, not because training runs 8x
-# longer in wall-clock terms.
-epochs: 2150
-warmup_epochs: 215
+epochs: 250
+warmup_epochs: 25
 
 wandb: true
 wandb_entity: palinaskipar-zdro-tech
 wandb_project: smri-fm-tome
 
-# datasets.*.paths is ignored when local_pt_source (above) is set -- kept
-# here only so `format: local_pt` still selects the local-file code path.
-# See src/data/local_pt_dataset.py and experiments/tome_pretrain/README.md.
+# All 965/10 files from asparagus's own split (fold 0) -- see the img_size
+# comment above for why nothing is filtered out here.
 datasets:
   fomo_train:
     format: local_pt
+    paths: /workspace/fomo26/processed_data/PT902_FOMO300K_HF/split_99_01_00.json#train
     shuffle: true
     drop_last: true
 
   fomo_val:
     format: local_pt
+    paths: /workspace/fomo26/processed_data/PT902_FOMO300K_HF/split_99_01_00.json#val
     shuffle: false
     drop_last: false
 

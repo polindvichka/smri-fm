@@ -13,28 +13,36 @@ many nodes -- irrelevant on local disk with one GPU, but replicating the
 *format* here means create_data_loaders only needs one small branch instead
 of forking the whole training loop.
 
-v2: random-crop sampling instead of whole-volume center-crop/pad. The first
-version resized every volume to the full pretraining img_size
-(208x240x208), which for most of this dataset meant mostly zero-padding --
-checked directly: 82% of a 60-file sample filled <30% of that canvas, and
-*every* DWI/perfusion file (139/965 total) filled 0%, since those are
-thin-slice sequences, not full anatomical volumes. asparagus's own
-pretraining doesn't have this problem because it randomly samples small
-crops (160cube for ResEncUNet/U-Net, 96cube for Primus-S) from wherever
-there's content, rather than resizing the whole volume -- this version does
-the same. Filtering to only volumes with every spatial dim >= crop_size
-(so a crop is always 100% real content, never padded) drops the dataset to
-131/965 files (all DWI/perfusion and undersized anat scans excluded) -- see
-experiments/tome_pretrain/README.md for the full accounting.
+v3: per-axis crop-or-pad, using ~all 965 files. History:
+- v1 resized every volume to the full pretraining img_size (208x240x208)
+  regardless of native shape, which for most of this dataset meant mostly
+  zero-padding -- 82% of a 60-file sample filled <30% of that canvas, every
+  DWI/perfusion file (139/965) filled 0% (those are thin-slice sequences,
+  not full anatomical volumes). Confirmed visually: the wandb reconstruction
+  plot showed sagittal/coronal views that were almost entirely black.
+- v2 fixed this by filtering to only volumes with every spatial dim >=
+  crop_size, cropping the rest at random (asparagus's own approach). That
+  guarantees zero padding, but drops the dataset to 131/965 files -- far
+  fewer than the ~1000-scan subset the checkpoints this is meant to be
+  comparable to were pretrained on.
+- v3 (this version): crop each axis independently -- take a real crop on
+  any axis that's already >= crop_size, and pad *only* the axes that are
+  actually too small, instead of either resizing everything or discarding
+  anything not uniformly big enough. E.g. a [17, 512, 512] DWI file gets a
+  fully-real random 160x160 crop on its two large axes and padding on just
+  the one 17-voxel axis, rather than being excluded outright (v2) or having
+  every axis mangled by a single whole-volume resize (v1). This keeps ~965
+  files usable while still fixing v1's bug, since the padding is now
+  minimized to only the axes that need it, not applied uniformly.
 
-Note this was never a training-*correctness* bug: the model already
+Whatever padding remains (e.g. the thin axis above) is never a
+training-*correctness* problem regardless of version: the model already
 excludes padded/invalid voxels from both context and loss via img_mask (see
-MaskedAutoencoderViT.prepare_masks), so the old version wasn't teaching the
-model wrong information -- it was wasting most of the compute budget on
-patches that contributed nothing, and drastically reducing the effective
-information content of most training samples.
+MaskedAutoencoderViT.prepare_masks). v1's problem was wasting most of the
+compute budget on patches that contributed nothing, not corrupting
+training with fake targets.
 
-Other known simplifications (still true in v2):
+Other known simplifications (still true in v3):
 - Foreground mask is a plain intensity threshold (`image > 0`), not a real
   brain mask (no skull-stripping/SynthSeg step was applied when this .pt
   data was saved -- see PT902_FOMO300K_HF/dataset.json, crop_to_nonzero:
@@ -59,23 +67,32 @@ from torch.utils.data import DataLoader, Dataset
 import data.mri_data as mri_data
 
 
-def random_crop(image: Tensor, crop_size: tuple[int, int, int]) -> Tensor:
-    """image: [C, D, H, W], every spatial dim must already be >= crop_size
-    (callers filter for this -- see LocalPtDataset._filter_paths). Always
-    returns 100% real content, no padding."""
-    starts = []
-    for s, c in zip(image.shape[1:], crop_size):
-        max_start = s - c
-        start = int(torch.randint(0, max_start + 1, (1,)).item()) if max_start > 0 else 0
-        starts.append(start)
-    slices = tuple(slice(start, start + c) for start, c in zip(starts, crop_size))
-    return image[(slice(None), *slices)]
+def crop_or_pad(image: Tensor, crop_size: tuple[int, int, int], train: bool) -> tuple[Tensor, Tensor]:
+    """image: [C, D, H, W]. Per spatial axis: if the source is already >=
+    crop_size, take a real crop (random offset if train, else centered);
+    if it's smaller, center-pad just that axis. Returns (image, valid_mask),
+    both [C, *crop_size]; valid_mask is True where content is real (as
+    opposed to padding introduced on an undersized axis)."""
+    C = image.shape[0]
+    src_shape = image.shape[1:]
+    out = image.new_zeros((C, *crop_size))
+    valid = torch.zeros((C, *crop_size), dtype=torch.bool)
 
+    src_slices, dst_slices = [], []
+    for s, c in zip(src_shape, crop_size):
+        if s >= c:
+            max_start = s - c
+            start = int(torch.randint(0, max_start + 1, (1,)).item()) if (train and max_start > 0) else max_start // 2
+            src_slices.append(slice(start, start + c))
+            dst_slices.append(slice(0, c))
+        else:
+            start = (c - s) // 2
+            src_slices.append(slice(0, s))
+            dst_slices.append(slice(start, start + s))
 
-def center_crop(image: Tensor, crop_size: tuple[int, int, int]) -> Tensor:
-    starts = [(s - c) // 2 for s, c in zip(image.shape[1:], crop_size)]
-    slices = tuple(slice(start, start + c) for start, c in zip(starts, crop_size))
-    return image[(slice(None), *slices)]
+    out[(slice(None), *dst_slices)] = image[(slice(None), *src_slices)]
+    valid[(slice(None), *dst_slices)] = True
+    return out, valid
 
 
 def pack_sparse_sample(image: Tensor, img_mask: Tensor, meta: dict) -> dict:
@@ -101,25 +118,12 @@ class LocalPtDataset(Dataset):
         intensity_percentile: float = 99.5,
         intensity_sample_size: int = 200_000,
     ):
+        self.paths = paths
         self.crop_size = tuple(int(d) for d in crop_size)
         self.in_chans = in_chans
         self.train = train
         self.intensity_percentile = intensity_percentile
         self.intensity_sample_size = intensity_sample_size
-        self.paths = self._filter_paths(paths)
-        if not self.paths:
-            raise ValueError(
-                f"no files have every spatial dim >= crop_size {self.crop_size} "
-                f"out of {len(paths)} candidates"
-            )
-
-    def _filter_paths(self, paths: list[str]) -> list[str]:
-        kept = []
-        for p in paths:
-            shape = torch.load(p, map_location="cpu", weights_only=False).shape[1:]
-            if all(d >= c for d, c in zip(shape, self.crop_size)):
-                kept.append(p)
-        return kept
 
     def __len__(self) -> int:
         return len(self.paths)
@@ -133,8 +137,8 @@ class LocalPtDataset(Dataset):
             if self.in_chans > 1:
                 image = image.expand(self.in_chans, *image.shape[1:]).contiguous()
 
-        image = random_crop(image, self.crop_size) if self.train else center_crop(image, self.crop_size)
-        img_mask = image > 0
+        image, valid = crop_or_pad(image, self.crop_size, self.train)
+        img_mask = valid & (image > 0)
 
         fg = image[img_mask]
         if fg.numel() > 0:
@@ -151,7 +155,13 @@ class LocalPtDataset(Dataset):
 
 
 def filter_usable_paths(paths: list[str], crop_size: tuple[int, int, int]) -> list[str]:
-    """Every spatial dim must be >= crop_size for a fully-real (unpadded) crop."""
+    """Every spatial dim must be >= crop_size for a fully-real (unpadded) crop.
+
+    Not used by default (LocalPtDataset now handles undersized axes via
+    per-axis padding instead of exclusion, see crop_or_pad) -- kept as an
+    opt-in for a stricter "zero padding ever" mode via local_pt_source, if
+    a future run wants to trade data quantity for that guarantee again.
+    """
     kept = []
     for p in paths:
         shape = torch.load(p, map_location="cpu", weights_only=False).shape[1:]
@@ -161,14 +171,7 @@ def filter_usable_paths(paths: list[str], crop_size: tuple[int, int, int]) -> li
 
 
 def split_train_val(paths: list[str], val_fraction: float, seed: int = 0) -> tuple[list[str], list[str]]:
-    """Deterministic shuffle-and-split of an already-filtered pool.
-
-    asparagus's precomputed split_*.json assumes ~all files are usable, which
-    breaks down once local_pt_dataset filters for crop-size fit -- e.g. only
-    1/10 files in a 10-file val split might survive filtering, an unusably
-    small, single-sample eval set. Splitting the *usable* pool ourselves
-    guarantees both sides are non-trivially sized.
-    """
+    """Deterministic shuffle-and-split of an already-filtered pool."""
     paths = list(paths)
     random.Random(seed).shuffle(paths)
     n_val = max(1, round(len(paths) * val_fraction))
@@ -195,10 +198,12 @@ def create_local_data_loaders(args):
     experiments/tome_pretrain/config.yaml). Crop size == args.img_size.
 
     If args.local_pt_source is set, train/val paths are both drawn from that
-    one shared pool: filtered for crop-size fit once, then split ourselves
-    (args.local_pt_val_fraction, default 0.1) -- see split_train_val's
-    docstring for why. Otherwise falls back to each dataset's own `paths`
-    spec, each independently filtered (the original per-split behavior)."""
+    one shared pool: filtered for crop-size fit (filter_usable_paths) once,
+    then split ourselves (args.local_pt_val_fraction, default 0.1) -- an
+    opt-in stricter mode, see filter_usable_paths' docstring. Otherwise (the
+    default) falls back to each dataset's own `paths` spec as-is, with
+    LocalPtDataset padding undersized axes per-sample instead of excluding
+    files."""
     data_loaders = {}
     dataset_names = [args.train_dataset] + list(args.eval_datasets)
 
@@ -231,8 +236,7 @@ def create_local_data_loaders(args):
             in_chans=int(args.get("in_chans", 1)),
             train=is_train,
         )
-        if path_map is None:
-            print(f"{dataset_name}: {len(dataset)}/{len(paths)} files usable at crop_size={args.img_size}")
+        print(f"{dataset_name}: {len(dataset)} files, crop_size={args.img_size}")
 
         num_workers = int(args.num_workers)
         loader = DataLoader(
