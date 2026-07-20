@@ -106,6 +106,31 @@ class Attention(nn.Module):
         x = self.proj(x)
         return x
 
+    def forward_with_metric(
+        self,
+        x: Float[Tensor, "L D"],
+        jagged_batch: JaggedBatch,
+    ) -> tuple[Float[Tensor, "L D"], Float[Tensor, "L Dh"]]:
+        """Same as forward, but also returns the head-averaged key vectors used as
+        the token-similarity metric for ToMe merging (Bolya et al. 2022), reusing
+        the keys already computed for attention instead of a separate pass."""
+        L, D = x.shape
+        h, dh = self.num_heads, self.head_dim
+
+        qkv = self.qkv(x).reshape(L, 3, h, dh)
+        q, k, v = qkv.unbind(1)
+
+        out = jagged_scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            jagged_batch=jagged_batch,
+        )
+        out = out.reshape(L, D)
+        out = self.proj(out)
+        metric = k.mean(dim=1)
+        return out, metric
+
 
 class Mlp(nn.Module):
     def __init__(
@@ -173,6 +198,22 @@ class Block(nn.Module):
         )
         x = x + self.drop_path2(self.mlp(self.norm2(x)))
         return x
+
+    def forward_with_metric(
+        self,
+        x: Float[Tensor, "L D"],
+        jagged_batch: JaggedBatch,
+    ) -> tuple[Float[Tensor, "L D"], Float[Tensor, "L Dh"]]:
+        """Same as forward, but also returns the ToMe merge metric (see
+        Attention.forward_with_metric). Used only by the encoder's ToMe path;
+        the decoder and the default encoder path keep using plain forward()."""
+        attn_out, metric = self.attn.forward_with_metric(
+            self.norm1(x),
+            jagged_batch=jagged_batch,
+        )
+        x = x + self.drop_path1(attn_out)
+        x = x + self.drop_path2(self.mlp(self.norm2(x)))
+        return x, metric
 
 
 # Patching and position embedding modules

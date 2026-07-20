@@ -1,0 +1,20 @@
+# Overrides merged on top of src/smri_mae/config/default_pretrain.yaml
+# (main_pretrain.py --cfg-path). Only lists what differs from the default
+# pretraining run, so this experiment stays a single-variable comparison
+# (Token Merging on vs off) against the baseline config.
+#
+# See experiments/tome_pretrain/README.md for background and how to run.
+
+name: tome_pretrain
+notes: >
+  Token Merging (Bolya et al. 2022, https://arxiv.org/abs/2210.09461) in the
+  MAE encoder. Merges tome_r token pairs per block (patch tokens only,
+  cls/reg tokens excluded). See src/smri_mae/tome.py.
+
+model_kwargs:
+  tome_r: 16
+
+# Keep this experiment's checkpoints separate from any other run.
+output_dir: checkpoints/experiments
+
+r2_sync: null

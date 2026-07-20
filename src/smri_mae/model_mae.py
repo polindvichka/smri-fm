@@ -36,6 +36,7 @@ from .modules import (
     unpack_tokens,
 )
 from .masking import pad_patch_mask
+from .tome import tome_merge_packed
 
 
 class MaskedEncoder(nn.Module):
@@ -60,6 +61,7 @@ class MaskedEncoder(nn.Module):
         final_norm: bool = True,
         drop_path_rate: float = 0.0,
         mask_drop_scale: bool = False,
+        tome_r: int = 0,
     ):
         super().__init__()
         self.num_prefix_tokens = int(class_token) + reg_tokens
@@ -69,6 +71,11 @@ class MaskedEncoder(nn.Module):
 
         # scale inputs by 1 / observed rate (like dropout)
         self.mask_drop_scale = mask_drop_scale
+
+        # Token Merging (ToMe, Bolya et al. 2022): merge this many token pairs per
+        # block, among patch tokens only (cls/reg tokens are never merged). 0 disables
+        # merging entirely and reproduces the original encoder exactly. See tome.py.
+        self.tome_r = tome_r
 
         # inject tokenization modules, so that the encoder doesn't specifically need to
         # know how the data are tokenized, while still implementing a complete
@@ -232,21 +239,43 @@ class MaskedEncoder(nn.Module):
             mask_ids = None
             token_mask = None
 
-        cls_embeds, reg_embeds, patch_embeds = self.forward_patch_embeds(
+        cls_embeds, reg_embeds, patch_embeds, merged_ids, merged_token_mask = self.forward_patch_embeds(
             x,
             token_mask=token_mask,
+            patch_ids=mask_ids,
         )
+        if merged_ids is not None:
+            # ToMe was active: fewer (and possibly per-sample unequal) patch tokens
+            # survived than pad_patch_mask originally selected, so mask_ids/token_mask
+            # must reflect what patch_embeds actually contains now.
+            mask_ids, token_mask = merged_ids, merged_token_mask
         return cls_embeds, reg_embeds, patch_embeds, mask, mask_ids, token_mask
 
     def forward_patch_embeds(
         self,
         x: Float[Tensor, "B L D"],
         token_mask: Tensor | None = None,
+        patch_ids: Tensor | None = None,
     ) -> tuple[
         Float[Tensor, "B 1 D"] | None,
         Float[Tensor, "B R D"] | None,
         Float[Tensor, "B L D"],
+        Int[Tensor, "B L2"] | None,
+        Tensor | None,
     ]:
+        """
+        patch_ids: original patch-grid index of each token in x's L dimension
+            (i.e. mask_ids from forward()). Required to enable ToMe merging
+            (self.tome_r > 0); without it merging is skipped even if tome_r > 0,
+            since there would be no way to report surviving tokens' positions to
+            the decoder afterwards.
+
+        returns, in addition to the usual cls/reg/patch embeddings:
+        - merged patch_ids, or None if merging did not happen (caller should then
+          keep using whatever patch_ids/token_mask it already had, unchanged)
+        - merged token_mask (aligned with patch_embeds and the merged patch_ids),
+          or None along with the above
+        """
         B = x.shape[0]
         if token_mask is None:
             token_mask = torch.ones(x.shape[:2], dtype=torch.bool, device=x.device)
@@ -254,13 +283,48 @@ class MaskedEncoder(nn.Module):
         token_mask = self.cat_token_mask(token_mask, B)
         jagged_batch = JaggedBatch.from_mask(token_mask)
         x = x[token_mask]
+
+        merging = self.tome_r > 0 and patch_ids is not None
+        if not merging:
+            for block in self.blocks:
+                x = block(x, jagged_batch=jagged_batch)
+            x = self.norm(x)
+            x = unpack_tokens(x, token_mask)
+            cls_embeds, reg_embeds, patch_embeds = self.chunk_tokens(x)
+            return cls_embeds, reg_embeds, patch_embeds, None, None
+
+        # prefix (cls/reg) tokens get a dummy id: never read, since it is stripped
+        # off (along with the prefix embeddings themselves) before returning.
+        prefix_ids = patch_ids.new_zeros((B, self.num_prefix_tokens))
+        pos_ids = torch.cat([prefix_ids, patch_ids], dim=1)[token_mask]
+        size = torch.ones((x.shape[0], 1), dtype=x.dtype, device=x.device)
+
         for block in self.blocks:
-            x = block(x, jagged_batch=jagged_batch)
+            x, metric = block.forward_with_metric(x, jagged_batch=jagged_batch)
+            x, size, pos_ids, jagged_batch = tome_merge_packed(
+                x,
+                metric,
+                size,
+                pos_ids,
+                jagged_batch,
+                self.num_prefix_tokens,
+                self.tome_r,
+            )
         x = self.norm(x)
-        x = unpack_tokens(x, token_mask)
+
+        counts = jagged_batch.offsets[1:] - jagged_batch.offsets[:-1]
+        new_token_mask = (
+            torch.arange(jagged_batch.max_seqlen, device=x.device).unsqueeze(0) < counts.unsqueeze(1)
+        )
+        x = unpack_tokens(x, new_token_mask)
+        pos_ids = unpack_tokens(pos_ids.unsqueeze(-1), new_token_mask).squeeze(-1)
 
         cls_embeds, reg_embeds, patch_embeds = self.chunk_tokens(x)
-        return cls_embeds, reg_embeds, patch_embeds
+        # strip the prefix span to align with patch_embeds (mask_ids/token_mask are
+        # patch-only, matching pad_patch_mask's original contract).
+        merged_ids = pos_ids[:, self.num_prefix_tokens :]
+        merged_token_mask = new_token_mask[:, self.num_prefix_tokens :]
+        return cls_embeds, reg_embeds, patch_embeds, merged_ids, merged_token_mask
 
     def forward_visible_ids(
         self,
@@ -285,7 +349,10 @@ class MaskedEncoder(nn.Module):
         x = self.pos_embed(x)
         visible_ids = visible_ids.to(device=x.device)
         x = x.gather(1, visible_ids.unsqueeze(-1).expand(-1, -1, x.shape[-1]))
-        return self.forward_patch_embeds(x)
+        # no patch_ids passed: this path never merges, regardless of self.tome_r
+        # (feature-extraction callers don't track per-token positions to update).
+        cls_embeds, reg_embeds, patch_embeds, _, _ = self.forward_patch_embeds(x)
+        return cls_embeds, reg_embeds, patch_embeds
 
     def forward_embedding(
         self,
@@ -479,6 +546,7 @@ class MaskedAutoencoderViT(nn.Module, PyTorchModelHubMixin):
         no_decode_pos: bool = False,
         pos_embed: Literal["abs", "sep", "sincos"] = "sincos",
         target_norm: Literal["none", "global", "slice", "patch"] | None = None,
+        tome_r: int = 0,
     ):
         super().__init__()
         img_size = _to_3d_tuple(img_size, "img_size")
@@ -518,6 +586,7 @@ class MaskedAutoencoderViT(nn.Module, PyTorchModelHubMixin):
             no_embed_class=no_embed_class,
             drop_path_rate=drop_path_rate,
             mask_drop_scale=mask_drop_scale,
+            tome_r=tome_r,
         )
 
         self.pred_patchify = patchify
