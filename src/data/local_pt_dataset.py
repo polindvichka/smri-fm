@@ -67,7 +67,7 @@ from torch.utils.data import DataLoader, Dataset
 import data.mri_data as mri_data
 
 
-def crop_or_pad(image: Tensor, crop_size: tuple[int, int, int], train: bool) -> tuple[Tensor, Tensor]:
+def crop_or_pad(image: Tensor, crop_size: tuple[int, int, int], train: bool, force_random: bool = False) -> tuple[Tensor, Tensor]:
     """image: [C, D, H, W]. Per spatial axis: if the source is already >=
     crop_size, take a real crop (random offset if train, else centered);
     if it's smaller, center-pad just that axis. Returns (image, valid_mask),
@@ -78,11 +78,12 @@ def crop_or_pad(image: Tensor, crop_size: tuple[int, int, int], train: bool) -> 
     out = image.new_zeros((C, *crop_size))
     valid = torch.zeros((C, *crop_size), dtype=torch.bool)
 
+    random_offset = train or force_random
     src_slices, dst_slices = [], []
     for s, c in zip(src_shape, crop_size):
         if s >= c:
             max_start = s - c
-            start = int(torch.randint(0, max_start + 1, (1,)).item()) if (train and max_start > 0) else max_start // 2
+            start = int(torch.randint(0, max_start + 1, (1,)).item()) if (random_offset and max_start > 0) else max_start // 2
             src_slices.append(slice(start, start + c))
             dst_slices.append(slice(0, c))
         else:
@@ -130,15 +131,25 @@ class LocalPtDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict:
         path = self.paths[idx % len(self.paths)]
-        image = torch.load(path, map_location="cpu", weights_only=False).float()
+        image_full = torch.load(path, map_location="cpu", weights_only=False).float()
 
-        if image.shape[0] != self.in_chans:
-            image = image[:1]
+        if image_full.shape[0] != self.in_chans:
+            image_full = image_full[:1]
             if self.in_chans > 1:
-                image = image.expand(self.in_chans, *image.shape[1:]).contiguous()
+                image_full = image_full.expand(self.in_chans, *image_full.shape[1:]).contiguous()
 
-        image, valid = crop_or_pad(image, self.crop_size, self.train)
-        img_mask = valid & (image > 0)
+        # A crop is picked at a uniformly random offset regardless of where a
+        # volume's real content is, so for scans with a small content
+        # footprint inside a large field of view (common in the DWI/perfusion
+        # files) an unlucky draw can land entirely on background -- an
+        # all-invalid img_mask crashes training (forward_loss divides by the
+        # per-sample valid-voxel count). Retry a few times with fresh random
+        # offsets first (regardless of train/eval) before giving up.
+        for attempt in range(8):
+            image, valid = crop_or_pad(image_full, self.crop_size, self.train, force_random=attempt > 0)
+            img_mask = valid & (image > 0)
+            if img_mask.any():
+                break
 
         fg = image[img_mask]
         if fg.numel() > 0:
