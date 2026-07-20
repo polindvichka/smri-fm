@@ -26,12 +26,16 @@ output_dir: checkpoints/experiments
 
 r2_sync: null
 
-# Match the previous asparagus pretraining runs' max_samples=60000 budget:
-# 965 train samples (see datasets.fomo_train below) x 62 epochs ~= 60k total
-# sample-visits. warmup_epochs scaled to keep the same ~10% warmup fraction
-# as default_pretrain.yaml's 10/100.
-epochs: 60
-warmup_epochs: 6
+# 965 train samples x epochs. Matching the asparagus runs' total *samples*
+# (60000, ~62 epochs here) isn't enough on its own: their effective batch
+# size was 4, ours is 16 (below), so matching samples alone would give ~4x
+# fewer gradient steps (~3.6k vs their 15k) -- and ViTs typically need *more*
+# steps than the CNNs (ResEncUNet/U-Net) they were compared against to reach
+# a useful representation, not fewer. 250 epochs x 965 samples / 16 per step
+# ~= 15k steps, matching their step count instead of their sample count.
+# warmup_epochs kept at the same ~10% fraction as default_pretrain.yaml.
+epochs: 250
+warmup_epochs: 25
 
 wandb: true
 wandb_entity: palinaskipar-zdro-tech
