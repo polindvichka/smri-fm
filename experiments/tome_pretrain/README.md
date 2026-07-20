@@ -1,5 +1,21 @@
 # Token Merging (ToMe) pretraining experiment
 
+**Current status / source of truth**: `config.yaml` has moved on from the
+numbers quoted in the verification notes below (img_size is now 160cube not
+208x240x208, batch_size is 8 not 4, all 965/10 files are used — see
+`src/data/local_pt_dataset.py`'s module docstring and its git log for why).
+Treat everything below as a record of what was checked and why, not the
+current config — `config.yaml` is authoritative for actual run parameters.
+
+**Baseline**: there is one shared baseline for both this experiment and the
+sibling `smri-fm-edgeloss/experiments/edgeloss_pretrain/` — `tome_r=0` here
+and `edge_loss_weight=0` there both reduce to the exact same unmodified
+`mae_vit_small` recipe (same seed, same data, same everything else; verified
+by diffing the two repos' default_pretrain.yaml, the only difference is the
+edge_loss_weight key existing at all). Run the baseline **once**, from
+either repo, and compare both experiments against that single run — see
+"Running for real" below.
+
 Adds Token Merging (Bolya et al., ICLR 2023, https://arxiv.org/abs/2210.09461)
 to the MAE encoder in `src/smri_mae/`. Implementation: `src/smri_mae/tome.py`
 plus small additive hooks in `modules.py`
@@ -105,15 +121,21 @@ uv run python src/smri_mae/main_pretrain.py \
   --cfg-path experiments/tome_pretrain/config.yaml
 ```
 
-This trains from a fresh random init (no `ckpt` set), for the full
-`epochs: 100` default inherited from `default_pretrain.yaml` — that's a long
-run on one 4090 at full resolution; consider overriding `epochs` down for a
-first real (non-debug) readout, e.g. `--overrides epochs=5`.
+This trains from a fresh random init (no `ckpt` set).
 
-For an apples-to-apples baseline comparison, run the same command with
-`model_kwargs.tome_r=0` via `--overrides` (same data/seed/epochs
-otherwise), and compare train/eval loss curves and wall-clock time per
-epoch between the two runs.
+For the shared baseline comparison (see "Baseline" above — do this **once**,
+not once per experiment), run the same command with `model_kwargs.tome_r=0`
+via `--overrides`:
+
+```sh
+uv run python src/smri_mae/main_pretrain.py \
+  --cfg-path experiments/tome_pretrain/config.yaml \
+  --overrides model_kwargs.tome_r=0 name=pretrain_baseline
+```
+
+Compare train/eval loss curves and wall-clock time per epoch across all
+three runs (this baseline, `tome_pretrain`, and the sibling repo's
+`edgeloss_pretrain`).
 
 Alternative worth considering: instead of training from scratch, continue
 training the already-pretrained checkpoint
