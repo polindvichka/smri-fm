@@ -11,6 +11,13 @@ notes: >
   MAE encoder. Merges tome_r token pairs per block (patch tokens only,
   cls/reg tokens excluded). See src/smri_mae/tome.py.
 
+# mae_vit_large (316M params, default_pretrain.yaml's default) is far bigger
+# than the ResEncUNet-B/U-Net-B/Primus-S checkpoints this experiment is meant
+# to be comparable to. mae_vit_small (embed_dim=384, depth=12) is close to
+# Primus-S's own size (embed_dim=396, depth=12) -- the closest match
+# available among mae_vit_* variants.
+model: mae_vit_small
+
 model_kwargs:
   tome_r: 16
 
@@ -18,6 +25,17 @@ model_kwargs:
 output_dir: checkpoints/experiments
 
 r2_sync: null
+
+# Match the previous asparagus pretraining runs' max_samples=60000 budget:
+# 965 train samples (see datasets.fomo_train below) x 62 epochs ~= 60k total
+# sample-visits. warmup_epochs scaled to keep the same ~10% warmup fraction
+# as default_pretrain.yaml's 10/100.
+epochs: 60
+warmup_epochs: 6
+
+wandb: true
+wandb_entity: palinaskipar-zdro-tech
+wandb_project: smri-fm-tome
 
 # No real webdataset shards available locally -- read the asparagus-format
 # .pt tensors directly instead (see src/data/local_pt_dataset.py and
@@ -39,8 +57,9 @@ datasets:
 # default_pretrain.yaml's batch_size=64 targets multi-GPU H100 training; at
 # full resolution (img_size 208x240x208) a single 4090 needs much smaller
 # per-step batches. accum_iter recovers a larger effective batch size.
-# batch_size=4 measured at ~11GB peak (of 24GB) during a smoke test -- there
-# may be room to push higher, untested.
-batch_size: 4
-accum_iter: 4
+# batch_size=8 measured at ~6.4GB peak (of 24GB) with mae_vit_small -- data
+# loading (~0.4-0.5s/it) dominates step time more than the GPU does at this
+# model size, so pushing batch size further likely won't speed things up much.
+batch_size: 8
+accum_iter: 2
 num_workers: 4
