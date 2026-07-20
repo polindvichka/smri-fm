@@ -18,3 +18,27 @@ model_kwargs:
 output_dir: checkpoints/experiments
 
 r2_sync: null
+
+# No real webdataset shards available locally -- read the asparagus-format
+# .pt tensors directly instead (see src/data/local_pt_dataset.py and
+# experiments/tome_pretrain/README.md for what this does and its
+# simplifications vs. a real shard-building pipeline).
+datasets:
+  fomo_train:
+    format: local_pt
+    paths: /workspace/fomo26/processed_data/PT902_FOMO300K_HF/split_99_01_00.json#train
+    shuffle: true
+    drop_last: true
+
+  fomo_val:
+    format: local_pt
+    paths: /workspace/fomo26/processed_data/PT902_FOMO300K_HF/split_99_01_00.json#val
+    shuffle: false
+    drop_last: false
+
+# default_pretrain.yaml's batch_size=64 targets multi-GPU H100 training; at
+# full resolution (img_size 208x240x208) a single 4090 needs much smaller
+# per-step batches. accum_iter recovers a larger effective batch size.
+batch_size: 1
+accum_iter: 16
+num_workers: 4
