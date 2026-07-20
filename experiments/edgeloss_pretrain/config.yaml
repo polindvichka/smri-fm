@@ -1,0 +1,76 @@
+# Overrides merged on top of src/smri_mae_edgeloss/config/default_pretrain.yaml
+# (main_pretrain.py --cfg-path). Same comparability decisions as the sibling
+# ToMe experiment (see /workspace/smri-fm-tome/experiments/tome_pretrain/):
+# mae_vit_small (not the 316M-param default mae_vit_large) to stay in the
+# same capacity ballpark as the ResEncUNet-B/U-Net-B/Primus-S checkpoints
+# this is meant to be comparable to, and epochs picked to match total
+# gradient steps (not just total samples) against those runs' 15,000 steps.
+#
+# See experiments/edgeloss_pretrain/README.md for background and how to run.
+
+name: edgeloss_pretrain
+notes: >
+  Edge-aware loss reweighting in the MAE reconstruction loss: upweights
+  voxels near high-gradient tissue boundaries relative to flat interior
+  regions, so the model is pushed to get anatomical boundaries right instead
+  of coasting on easy flat regions that dominate by voxel count.
+  See src/smri_mae_edgeloss/model_mae.py (prepare_edge_weights,
+  gradient_magnitude_3d). edge_loss_weight=0 reproduces the unweighted MAE
+  loss exactly (verified bit-identical against the original smri_mae code).
+
+model: mae_vit_small
+
+model_kwargs:
+  edge_loss_weight: 2.0
+
+output_dir: checkpoints/experiments
+
+r2_sync: null
+
+# img_size doubles as the local_pt_dataset random-crop size. 160cube matches
+# the ResEncUNet-B/U-Net-B asparagus crop size, and (more importantly) is
+# the threshold local_pt_dataset filters volumes by so crops are always 100%
+# real content, never padded -- see src/data/local_pt_dataset.py's docstring
+# and the sibling ToMe experiment's README for why (82% of scans were mostly
+# zero-padding at the original full-volume 208x240x208 approach). 131/965
+# files across the whole dataset pass the filter at 160cube.
+img_size: [160, 160, 160]
+
+# asparagus's precomputed split_99_01_00.json assumes ~all files are usable,
+# which badly breaks down once local_pt_dataset filters by crop-size fit --
+# its 10-file val split had only 1 file survive. local_pt_source points both
+# fomo_train and fomo_val at the same full pool (paths.json, all 975 files);
+# create_local_data_loaders filters once and splits the *usable* 131 itself
+# (local_pt_val_fraction below), so both sides end up non-trivially sized.
+local_pt_source: /workspace/fomo26/processed_data/PT902_FOMO300K_HF/paths.json
+local_pt_val_fraction: 0.1
+
+# ~118 usable train files (131 usable x 90%) x epochs, still targeting ~15k
+# gradient steps (effective batch 16 -> ~7 steps/epoch -> epochs is large
+# mainly because "epoch" is now a much smaller unit, not because training
+# runs longer in wall-clock terms).
+epochs: 2150
+warmup_epochs: 215
+
+wandb: true
+wandb_entity: palinaskipar-zdro-tech
+wandb_project: smri-fm-edgeloss
+
+# Same local .pt data source/split logic as the ToMe experiment -- same
+# subset, same seed, so results are comparable across both experiments too.
+# datasets.*.paths is ignored when local_pt_source (above) is set -- kept
+# here only so `format: local_pt` still selects the local-file code path.
+datasets:
+  fomo_train:
+    format: local_pt
+    shuffle: true
+    drop_last: true
+
+  fomo_val:
+    format: local_pt
+    shuffle: false
+    drop_last: false
+
+batch_size: 8
+accum_iter: 2
+num_workers: 4
