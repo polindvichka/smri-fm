@@ -26,44 +26,58 @@ output_dir: checkpoints/experiments
 
 r2_sync: null
 
-# 965 train samples x epochs. Matching the asparagus runs' total *samples*
-# (60000, ~62 epochs here) isn't enough on its own: their effective batch
-# size was 4, ours is 16 (below), so matching samples alone would give ~4x
-# fewer gradient steps (~3.6k vs their 15k) -- and ViTs typically need *more*
-# steps than the CNNs (ResEncUNet/U-Net) they were compared against to reach
-# a useful representation, not fewer. 250 epochs x 965 samples / 16 per step
-# ~= 15k steps, matching their step count instead of their sample count.
-# warmup_epochs kept at the same ~10% fraction as default_pretrain.yaml.
-epochs: 250
-warmup_epochs: 25
+# img_size doubles as the local_pt_dataset random-crop size (see
+# src/data/local_pt_dataset.py). 160cube matches the crop size your
+# ResEncUNet-B/U-Net-B asparagus runs used -- also fixes the resolution
+# mismatch flagged earlier, and (more importantly) volumes must have every
+# spatial dim >= this to be usable at all without padding: at the original
+# 208x240x208 full-volume approach, 82% of scans were mostly zero-padding
+# (every DWI/perfusion file included), silently wasting most of the training
+# budget. At 160cube, 131/965 files across the whole dataset pass the filter
+# -- all real content, no padding. See the module docstring and
+# experiments/tome_pretrain/README.md for the full accounting.
+img_size: [160, 160, 160]
+
+# asparagus's precomputed split_99_01_00.json assumes ~all files are usable,
+# which badly breaks down once local_pt_dataset filters by crop-size fit --
+# its 10-file val split had only 1 file survive. local_pt_source points both
+# fomo_train and fomo_val at the same full pool (paths.json, all 975 files);
+# create_local_data_loaders filters once and splits the *usable* 131 itself
+# (local_pt_val_fraction below), so both sides end up non-trivially sized.
+local_pt_source: /workspace/fomo26/processed_data/PT902_FOMO300K_HF/paths.json
+local_pt_val_fraction: 0.1
+
+# ~118 usable train files (131 usable x 90%) x epochs. Still targeting ~15k
+# gradient steps to match the asparagus runs' step count -- at effective
+# batch 16, that's ~7 optimizer steps per epoch, so epochs is large mostly
+# because "epoch" is now a much smaller unit, not because training runs 8x
+# longer in wall-clock terms.
+epochs: 2150
+warmup_epochs: 215
 
 wandb: true
 wandb_entity: palinaskipar-zdro-tech
 wandb_project: smri-fm-tome
 
-# No real webdataset shards available locally -- read the asparagus-format
-# .pt tensors directly instead (see src/data/local_pt_dataset.py and
-# experiments/tome_pretrain/README.md for what this does and its
-# simplifications vs. a real shard-building pipeline).
+# datasets.*.paths is ignored when local_pt_source (above) is set -- kept
+# here only so `format: local_pt` still selects the local-file code path.
+# See src/data/local_pt_dataset.py and experiments/tome_pretrain/README.md.
 datasets:
   fomo_train:
     format: local_pt
-    paths: /workspace/fomo26/processed_data/PT902_FOMO300K_HF/split_99_01_00.json#train
     shuffle: true
     drop_last: true
 
   fomo_val:
     format: local_pt
-    paths: /workspace/fomo26/processed_data/PT902_FOMO300K_HF/split_99_01_00.json#val
     shuffle: false
     drop_last: false
 
-# default_pretrain.yaml's batch_size=64 targets multi-GPU H100 training; at
-# full resolution (img_size 208x240x208) a single 4090 needs much smaller
-# per-step batches. accum_iter recovers a larger effective batch size.
-# batch_size=8 measured at ~6.4GB peak (of 24GB) with mae_vit_small -- data
-# loading (~0.4-0.5s/it) dominates step time more than the GPU does at this
-# model size, so pushing batch size further likely won't speed things up much.
+# default_pretrain.yaml's batch_size=64 targets multi-GPU H100 training; a
+# single 4090 needs much smaller per-step batches. accum_iter recovers a
+# larger effective batch size. Measured ~6.4GB peak at the old 208x240x208
+# resolution -- 160cube crops use less, may be able to push batch size
+# higher, untested at the new resolution.
 batch_size: 8
 accum_iter: 2
 num_workers: 4
