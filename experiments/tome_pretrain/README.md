@@ -66,30 +66,76 @@ downstream eval paths) doesn't track that and will silently skip merging
 regardless of `tome_r` — intentional scope limit for this first pass, not a
 bug, but worth knowing if downstream eval speed matters too.
 
-## Blocker: no local pretraining data in the expected format
+## Data: local .pt files instead of real webdataset shards
 
-`default_pretrain.yaml` (which this config overrides) expects **webdataset
-tar shards** (`datasets/FOMO_with_dwi/shard.{000000..001620}.tar`). What we
-have locally under `/workspace/fomo26/processed_data/PT902_FOMO300K_HF` is
-the asparagus/fomo26 per-subject `.pt`/`.pkl` tensor format — a different
-pipeline, not directly readable by `main_pretrain.py`'s
-`create_data_loaders` (`src/data/mri_data.py`, hard-requires
-`webdataset.WebDataset`).
+`default_pretrain.yaml` expects **webdataset tar shards**
+(`datasets/FOMO_with_dwi/shard.{000000..001620}.tar`). We only have the
+asparagus/fomo26 per-subject `.pt`/`.pkl` tensor format locally
+(`/workspace/fomo26/processed_data/PT902_FOMO300K_HF`, 975 files, 5-fold
+splits in `split_99_01_00.json`), not real shards, and `main_pretrain.py`'s
+`create_data_loaders` hard-requires `webdataset.WebDataset`.
 
-Before an actual training run can start, need either:
-- pre-built webdataset shards for FOMO data (R2 has candidate folders worth
-  checking: `medarc/leema/FOMO300`, `medarc/leema/FOMO60k`, and variants —
-  not yet confirmed these are the right format/split), or
-- a local conversion script from the asparagus tensor format to webdataset
-  shards (none currently checked into this repo).
+`src/data/local_pt_dataset.py` (`LocalPtDataset` +
+`create_local_data_loaders`) reads the `.pt` files directly and packs each
+sample into the exact sparse format the training loop already expects
+(`mri_data.densify_sparse_image_batch`), so `main_pretrain.py`'s train/eval
+loop needed no changes — only `create_data_loaders` gained one branch,
+triggered by `datasets.<name>.format: local_pt` in this experiment's
+`config.yaml`. Known simplifications of this adapter (documented in the
+module docstring): center-crop/pad instead of physical resampling to a
+common voxel spacing, a plain intensity threshold instead of a real brain
+mask, and a per-volume robust-intensity rescale that isn't necessarily what
+the team's own shard-building does. Good enough to get a run launched and
+producing a real loss; not a faithful reproduction of the team's pipeline.
 
-## Running once data is resolved
+**Verified end-to-end** (`debug=true`, 10 batches, no real checkpoint
+loaded — fresh random init just to test plumbing):
+`.pt` files → `LocalPtDataset` → `collate` → `densify_sparse_image_batch` →
+MAE forward (`tome_r=16`) → backward → optimizer step → checkpoint saved →
+exited cleanly. Train loss 1.16, eval loss 0.69 on real FOMO300K subset
+data. Also checked GPU memory headroom: `batch_size=1` peaked at ~5.4GB,
+`batch_size=4` at ~11GB (of 24GB) — config now defaults to `batch_size=4,
+accum_iter=4` (effective batch 16); may be able to push batch size higher,
+untested.
+
+## Running for real
 
 ```sh
 uv run python src/smri_mae/main_pretrain.py \
   --cfg-path experiments/tome_pretrain/config.yaml
 ```
 
-For an apples-to-apples baseline comparison, run the same command without
-`--cfg-path` (or with `model_kwargs.tome_r=0` via `--overrides`) using
-identical data/seed/epochs.
+This trains from a fresh random init (no `ckpt` set), for the full
+`epochs: 100` default inherited from `default_pretrain.yaml` — that's a long
+run on one 4090 at full resolution; consider overriding `epochs` down for a
+first real (non-debug) readout, e.g. `--overrides epochs=5`.
+
+For an apples-to-apples baseline comparison, run the same command with
+`model_kwargs.tome_r=0` via `--overrides` (same data/seed/epochs
+otherwise), and compare train/eval loss curves and wall-clock time per
+epoch between the two runs.
+
+Alternative worth considering: instead of training from scratch, continue
+training the already-pretrained checkpoint
+(`checkpoints/pretrain_full_90_10_h100_4gpu_gbs64_int8_fresh_20260624_045811/checkpoint-last.pth`,
+symlinked into `checkpoints/`) with `--overrides ckpt=<path>` (loads model
+weights only, starts at epoch 0 with a fresh optimizer — not `resume=true`,
+which would also restore optimizer/epoch state and is for resuming an
+interrupted run of *this* experiment, not warm-starting from a different
+checkpoint). This tests "does turning on merging partway through hurt"
+rather than "does merging change what's learned from scratch" — a
+different, faster-to-read-out question, since it doesn't need to reach
+from-scratch convergence to have signal.
+
+**Also verified end-to-end** (same debug/10-batch smoke test, real
+checkpoint loaded via `ckpt=`, `batch_size=2`): loss started at 0.08 and
+dropped to ~0.03-0.04 within 10 steps — much lower than the from-scratch run
+above (1.16), as expected since these are real trained weights, confirming
+checkpoint-loading + the local data adapter + ToMe all work together
+correctly:
+
+```sh
+uv run python src/smri_mae/main_pretrain.py \
+  --cfg-path experiments/tome_pretrain/config.yaml \
+  --overrides ckpt=checkpoints/pretrain_full_90_10_h100_4gpu_gbs64_int8_fresh_20260624_045811/checkpoint-last.pth
+```

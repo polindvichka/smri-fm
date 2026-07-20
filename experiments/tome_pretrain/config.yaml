@@ -39,6 +39,8 @@ datasets:
 # default_pretrain.yaml's batch_size=64 targets multi-GPU H100 training; at
 # full resolution (img_size 208x240x208) a single 4090 needs much smaller
 # per-step batches. accum_iter recovers a larger effective batch size.
-batch_size: 1
-accum_iter: 16
+# batch_size=4 measured at ~11GB peak (of 24GB) during a smoke test -- there
+# may be room to push higher, untested.
+batch_size: 4
+accum_iter: 4
 num_workers: 4
