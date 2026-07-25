@@ -184,6 +184,7 @@ def main(args: DictConfig):
 
         ut.save_model(args, epoch, model_without_ddp, optimizer, loss_scaler)
         sync_checkpoints_to_r2(args, output_dir)
+        sync_checkpoints_to_hf(args, output_dir)
 
     if args.distributed:
         torch.distributed.destroy_process_group()
@@ -241,6 +242,46 @@ def sync_checkpoints_to_r2(args: DictConfig, output_dir: Path) -> None:
     subprocess.run(cmd, check=True)
 
 
+def sync_checkpoints_to_hf(args: DictConfig, output_dir: Path) -> None:
+    """Upload output_dir (checkpoint + config/log/eval files) to the HF Hub
+    repo/subfolder named by hf_repo_id/hf_subfolder, then delete any epoch
+    checkpoints on the Hub that are no longer kept locally (mirrors the
+    max_checkpoints cleanup save_model already did), so at most
+    max_checkpoints epoch checkpoints -- typically just one -- ever live on
+    the Hub. Blocking, like sync_checkpoints_to_r2: a run that finishes right
+    after this call must not exit before the final checkpoint's upload lands.
+    No-op if hf_repo_id isn't set.
+    """
+    hf_repo_id = args.get("hf_repo_id")
+    if not hf_repo_id or not ut.is_main_process():
+        return
+
+    from huggingface_hub import HfApi
+
+    api = HfApi()
+    subfolder = args.get("hf_subfolder") or args.name
+
+    print(f"syncing checkpoints to HF Hub: {output_dir} -> {hf_repo_id}/{subfolder}")
+    api.upload_folder(
+        folder_path=str(output_dir),
+        path_in_repo=subfolder,
+        repo_id=hf_repo_id,
+        repo_type="model",
+        allow_patterns=["checkpoint-*.pth", "*.yaml", "*.json", "*.txt", "*.png"],
+    )
+
+    kept_names = {p.name for p in output_dir.glob("checkpoint-[0-9]*.pth")}
+    kept_names.add("checkpoint-last.pth")
+    prefix = f"{subfolder}/"
+    for remote_path in api.list_repo_files(hf_repo_id, repo_type="model"):
+        if not remote_path.startswith(prefix):
+            continue
+        name = remote_path[len(prefix) :]
+        if name.startswith("checkpoint-") and name.endswith(".pth") and name not in kept_names:
+            print(f"removing superseded checkpoint from HF Hub: {remote_path}")
+            api.delete_file(path_in_repo=remote_path, repo_id=hf_repo_id, repo_type="model")
+
+
 def train_one_epoch(
     args: DictConfig,
     model: nn.Module,
@@ -267,7 +308,9 @@ def train_one_epoch(
     amp_dtype = getattr(torch, args.amp_dtype)
     use_cuda = device.type == "cuda"
     if use_cuda and args.presend_cuda:
-        data_loader = ut.pre_send_to_cuda_wrapper(data_loader, device, dtype_map={torch.float16: amp_dtype})
+        data_loader = ut.pre_send_to_cuda_wrapper(
+            data_loader, device, dtype_map={torch.float16: amp_dtype}
+        )
 
     optimizer.zero_grad()
 
@@ -369,7 +412,9 @@ def evaluate(
     if use_cuda:
         torch.cuda.manual_seed(eval_seed)
     if use_cuda and args.presend_cuda:
-        data_loader = ut.pre_send_to_cuda_wrapper(data_loader, device, dtype_map={torch.float16: amp_dtype})
+        data_loader = ut.pre_send_to_cuda_wrapper(
+            data_loader, device, dtype_map={torch.float16: amp_dtype}
+        )
 
     eval_batches = islice(data_loader, num_batches)
     for batch_idx, batch in enumerate(
@@ -397,9 +442,7 @@ def evaluate(
             )
 
         loss_value = loss.detach().float().item()
-        finite = torch.tensor(
-            int(math.isfinite(loss_value)), dtype=torch.int32, device=device
-        )
+        finite = torch.tensor(int(math.isfinite(loss_value)), dtype=torch.int32, device=device)
         if args.distributed:
             torch.distributed.all_reduce(finite, op=torch.distributed.ReduceOp.MIN)
         if not finite.item():
@@ -469,6 +512,7 @@ def make_plots(
     plt.close(mask_pred_fig)
 
     return plots
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
