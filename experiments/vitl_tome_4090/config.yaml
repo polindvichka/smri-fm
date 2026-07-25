@@ -1,0 +1,51 @@
+# Overrides merged on top of src/smri_mae/config/default_pretrain.yaml
+# (main_pretrain.py --cfg-path). Identical to the sibling repos' vitl_baseline_4090
+# / vitl_coarse2fine_4090 / vitl_edgeloss_4090 configs in every respect except
+# model_kwargs.tome_r -- this repo's model_mae.py is otherwise the same as the
+# plain baseline's when tome_r=0 (verified via diff), so this is a clean
+# single-variable comparison (token merging on vs off) against that baseline run.
+#
+# tome_r: 16 matches yesterday's experiments/tome_pretrain/config.yaml value.
+#
+# Same data cache, same batch/accum, same schedule, same everything else -- see
+# the baseline config's comments (in the sibling smri-fm repo) for the reasoning
+# (smoke-tested batch size, why the data is a local subset, etc.), not repeated
+# here.
+
+name: vitl_tome_4090
+notes: >
+  Token Merging (Bolya et al. 2022) trick applied on top of the same ViT-L /
+  full-resolution / FOMO300+DWI baseline recipe as vitl_baseline_4090.
+  Single-variable comparison: everything else is identical to that baseline
+  run. tome_r: 16 (merges 16 token pairs per encoder block), same value used
+  in yesterday's small-scale tome_pretrain experiment.
+
+model_kwargs:
+  tome_r: 16
+
+output_dir: checkpoints/experiments
+
+batch_size: 12
+accum_iter: 5
+
+datasets:
+  fomo_train:
+    url: /workspace/data/fomo_dwi_subset/train/shard.{000000..000059}.tar
+    samples_per_epoch: 9000
+    shuffle: true
+    buffer_size: 8000
+    drop_last: true
+
+  fomo_val:
+    url: /workspace/data/fomo_dwi_subset/val/shard.{001621..001626}.tar
+    samples_per_epoch: 900
+    shuffle: false
+    buffer_size: 900
+    drop_last: false
+
+checkpoint_period: 20
+max_checkpoints: 1
+
+wandb: true
+wandb_entity: palinaskipar-zdro-tech
+wandb_project: smri-fm-vitl-baseline-4090
