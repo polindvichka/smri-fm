@@ -444,11 +444,22 @@ def train_one_epoch(
         if need_update and log_step:
             loss_value = loss_for_log.item()
             grad_norm_value = grad_norm.item()
-            metric_logger.update(loss=loss_value, lr=lr, grad=grad_norm_value)
+            # last_raw_mse is set on every forward_loss call regardless of
+            # target_norm (see model_mae.py) -- it's the same quantity the
+            # plain model logs as its whole loss, so it's the fair number
+            # to compare against that baseline, unlike `loss` above, which
+            # is scored on normalized targets and so runs on a different
+            # scale once target_norm is set.
+            raw_mse_module = model.module if args.distributed else model
+            raw_mse_value = raw_mse_module.last_raw_mse.item()
+            metric_logger.update(
+                loss=loss_value, raw_mse=raw_mse_value, lr=lr, grad=grad_norm_value
+            )
             if log_wandb:
                 wandb.log(
                     {
                         "train/loss": loss_value,
+                        "train/raw_mse": raw_mse_value,
                         "train/lr": lr,
                         "train/grad": grad_norm_value,
                     },
@@ -529,6 +540,12 @@ def evaluate(
         if not finite.item():
             raise RuntimeError("non-finite validation loss detected")
         metric_logger.meters["loss"].update(loss_value, n=int(batch["img_mask"].shape[0]))
+        # see train_one_epoch's raw_mse comment: same quantity the plain
+        # model logs as its whole eval loss.
+        raw_mse_module = model.module if args.distributed else model
+        metric_logger.meters["raw_mse"].update(
+            raw_mse_module.last_raw_mse.item(), n=int(batch["img_mask"].shape[0])
+        )
 
         if is_master and batch_step == example_step:
             example_batch = {"image": images[:1], "img_mask": img_mask[:1]}

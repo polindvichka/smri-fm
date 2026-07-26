@@ -177,7 +177,7 @@ class MaskedEncoder(nn.Module):
         Tensor | None,
     ]:
         """
-        x: input data shape [B, C, D, H, W] 
+        x: input data shape [B, C, D, H, W]
         mask: visible mask, 1 = visible, 0 = invisible. broadcastable shape
         mask_ratio: mask ratio for uniform random masking
 
@@ -570,8 +570,14 @@ class MaskedAutoencoderViT(nn.Module, PyTorchModelHubMixin):
         images: [B, C, D, H, W]
         img_mask: mask of valid data. only used for computing correct normalization
             stats. same shape as images.
+
+        Returns (targets_patches, raw_targets_patches, targets_stats):
+        targets_patches is what forward_loss scores against (normalized, if
+        target_norm is set); raw_targets_patches is always the original,
+        un-normalized patchified image, used to compute a same-scale MSE
+        for cross-experiment comparison (see forward_loss).
         """
-        targets_patches = self.pred_patchify(images)  # [B, N, P]
+        raw_targets_patches = self.pred_patchify(images)  # [B, N, P]
 
         # target normalization
         if self.target_norm is not None:
@@ -580,11 +586,14 @@ class MaskedAutoencoderViT(nn.Module, PyTorchModelHubMixin):
                 img_mask_patches = self.pred_patchify(img_mask)
             else:
                 img_mask_patches = None
-            targets_patches, *targets_stats = self.target_norm(targets_patches, img_mask_patches)
+            targets_patches, *targets_stats = self.target_norm(
+                raw_targets_patches, img_mask_patches
+            )
         else:
+            targets_patches = raw_targets_patches
             targets_stats = None
 
-        return targets_patches, targets_stats
+        return targets_patches, raw_targets_patches, targets_stats
 
     def prepare_masks(
         self,
@@ -664,8 +673,18 @@ class MaskedAutoencoderViT(nn.Module, PyTorchModelHubMixin):
         pred_mask_patches: Float[Tensor, "B N P"],
         pred_ids: Int[Tensor, "B Q"],
         pred_token_mask: Tensor,
+        raw_targets_patches: Float[Tensor, "B N P"] | None = None,
+        targets_stats: tuple[Tensor, Tensor] | None = None,
     ) -> Tensor:
-        """Average valid-voxel MSE within each scan, then average across scans."""
+        """Average valid-voxel MSE within each scan, then average across scans.
+
+        Also caches self.last_raw_mse: MSE between un-normalized (original
+        intensity scale) predictions and the un-normalized target, computed
+        the same way a plain (target_norm=none) model computes its whole
+        loss -- so it's the fair number to compare against that baseline,
+        unlike the `loss` returned here, which is scored on normalized
+        targets and so runs on a different scale once target_norm is set.
+        """
         batch_ids, slot_ids = pred_token_mask.nonzero(as_tuple=True)
         patch_ids = pred_ids[batch_ids, slot_ids]
         targets = targets_patches[batch_ids, patch_ids]
@@ -674,13 +693,25 @@ class MaskedAutoencoderViT(nn.Module, PyTorchModelHubMixin):
         patch_errors = ((preds - targets) ** 2 * voxel_mask).sum(dim=1)
         patch_voxels = voxel_mask.sum(dim=1).to(dtype=patch_errors.dtype)
         batch_size = targets_patches.shape[0]
-        scan_errors = patch_errors.new_zeros(batch_size).scatter_add_(
-            0, batch_ids, patch_errors
-        )
-        scan_voxels = patch_voxels.new_zeros(batch_size).scatter_add_(
-            0, batch_ids, patch_voxels
-        )
-        return (scan_errors / scan_voxels).mean()
+        scan_errors = patch_errors.new_zeros(batch_size).scatter_add_(0, batch_ids, patch_errors)
+        scan_voxels = patch_voxels.new_zeros(batch_size).scatter_add_(0, batch_ids, patch_voxels)
+        loss = (scan_errors / scan_voxels).mean()
+
+        if targets_stats is None:
+            self.last_raw_mse = loss.detach()
+        else:
+            targets_mean, targets_std = targets_stats
+            mean_tok = targets_mean[batch_ids, patch_ids]
+            std_tok = targets_std[batch_ids, patch_ids]
+            raw_preds = preds.detach() * std_tok + mean_tok
+            raw_targets = raw_targets_patches[batch_ids, patch_ids]
+            raw_errors = ((raw_preds - raw_targets) ** 2 * voxel_mask).sum(dim=1)
+            raw_scan_errors = raw_errors.new_zeros(batch_size).scatter_add_(
+                0, batch_ids, raw_errors
+            )
+            self.last_raw_mse = (raw_scan_errors / scan_voxels).mean().detach()
+
+        return loss
 
     @torch.no_grad()
     def forward_pred_images(
@@ -724,7 +755,7 @@ class MaskedAutoencoderViT(nn.Module, PyTorchModelHubMixin):
             None,
             device=images.device,
         )
-        targets_patches, targets_stats = self.prepare_targets(images, img_mask)
+        targets_patches, raw_targets_patches, targets_stats = self.prepare_targets(images, img_mask)
 
         (
             cls_embeds,
@@ -763,6 +794,8 @@ class MaskedAutoencoderViT(nn.Module, PyTorchModelHubMixin):
             pred_mask_patches,
             pred_ids,
             pred_token_mask,
+            raw_targets_patches=raw_targets_patches,
+            targets_stats=targets_stats,
         )
 
         if not with_state:
