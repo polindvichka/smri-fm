@@ -728,20 +728,39 @@ class MaskedAutoencoderViT(nn.Module, PyTorchModelHubMixin):
         intensity-gradient magnitude (tissue boundaries) before averaging, so
         the loss emphasizes edges over flat, easy-to-interpolate interior
         regions instead of treating every voxel equally.
+
+        Also caches the plain (unweighted) MSE on self.last_plain_mse,
+        computed the same way regardless of edge_loss_weight -- this is the
+        same quantity the plain baseline model reports as its whole loss,
+        so it's the fair number to compare against that baseline, unlike
+        the edge-weighted value returned here, which runs on a different
+        scale once edge_loss_weight > 0.
         """
         batch_ids, slot_ids = pred_token_mask.nonzero(as_tuple=True)
         patch_ids = pred_ids[batch_ids, slot_ids]
         targets = targets_patches[batch_ids, patch_ids]
         voxel_mask = pred_mask_patches[batch_ids, patch_ids]
-
-        if edge_weights_patches is not None:
-            voxel_weight = voxel_mask * edge_weights_patches[batch_ids, patch_ids]
-        else:
-            voxel_weight = voxel_mask
-
-        patch_errors = ((preds - targets) ** 2 * voxel_weight).sum(dim=1)
-        patch_voxels = voxel_weight.sum(dim=1).to(dtype=patch_errors.dtype)
         batch_size = targets_patches.shape[0]
+
+        squared_error = (preds - targets) ** 2
+
+        plain_errors = (squared_error * voxel_mask).sum(dim=1)
+        plain_voxels = voxel_mask.sum(dim=1).to(dtype=plain_errors.dtype)
+        plain_scan_errors = plain_errors.new_zeros(batch_size).scatter_add_(
+            0, batch_ids, plain_errors
+        )
+        plain_scan_voxels = plain_voxels.new_zeros(batch_size).scatter_add_(
+            0, batch_ids, plain_voxels
+        )
+        plain_loss = (plain_scan_errors / plain_scan_voxels).mean()
+        self.last_plain_mse = plain_loss.detach()
+
+        if edge_weights_patches is None:
+            return plain_loss
+
+        voxel_weight = voxel_mask * edge_weights_patches[batch_ids, patch_ids]
+        patch_errors = (squared_error * voxel_weight).sum(dim=1)
+        patch_voxels = voxel_weight.sum(dim=1).to(dtype=patch_errors.dtype)
         scan_errors = patch_errors.new_zeros(batch_size).scatter_add_(0, batch_ids, patch_errors)
         scan_voxels = patch_voxels.new_zeros(batch_size).scatter_add_(0, batch_ids, patch_voxels)
         return (scan_errors / scan_voxels).mean()
