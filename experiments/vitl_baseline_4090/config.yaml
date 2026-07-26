@@ -1,0 +1,62 @@
+# Overrides merged on top of src/smri_mae/config/default_pretrain.yaml
+# (main_pretrain.py --cfg-path). Only lists what differs from the default
+# pretraining run.
+#
+# Goal: reproduce Mihir's ViT-L baseline recipe (pretrain_full_90_10_h100_4gpu_gbs64)
+# as closely as possible on a single RTX 4090, within a ~8 hour budget.
+# model/img_size/patch_size/mask_ratio/decoder_depth/epochs/warmup_epochs/lr/
+# schedule/r2_sync all already match the default_pretrain.yaml values, which
+# mirror his run -- so none of those are overridden here.
+#
+# What's different from his run, and why:
+# - batch_size/accum_iter: 12x5 micro-batches (global batch 60, close to his
+#   64) -- smoke-tested against 8x8 (global 64, 2.99s/step, 15.3GB) and 16x4
+#   (global 64, OOM at ~24GB); 12x5 fits with headroom (18.9GB) and is ~46%
+#   faster per sample (1.92s/step) than the 8x8 config.
+# - datasets: point at a small local cache (60 train + 6 val shards, streamed
+#   down once from R2's mihir-stuff/processed/FOMO300/wds_with_dwi/) instead
+#   of the full 1620/180-shard set, because a single R2 connection streams
+#   too slowly (~6.3MB/s measured) to feed the GPU live within the time
+#   budget, and local disk doesn't have room to cache the full dataset.
+# - checkpoint_period/max_checkpoints: spaced out and capped at 1, per
+#   request, to keep local disk use low (no R2/HF sync for this run).
+# - wandb: turned on, pointed at this user's own entity/project.
+
+name: vitl_baseline_4090
+notes: >
+  Plain ViT-Large MAE baseline (no architecture tricks), full FOMO300+DWI
+  data recipe matching Mihir's pretrain_full_90_10_h100_4gpu_gbs64 run as
+  closely as a single RTX 4090 + local disk/time budget allows. Meant as
+  the baseline to compare yesterday's small-scale ToMe/coarse-to-fine/
+  edge-loss experiments against, once those are re-run on this same data
+  recipe.
+
+output_dir: checkpoints/experiments
+
+batch_size: 12
+accum_iter: 5
+
+datasets:
+  fomo_train:
+    # 9000 samples/epoch = one full, non-repeating pass over the local cache
+    # each epoch. 9000/60 = 150 steps/epoch x 100 epochs = 15000 steps total.
+    # At the smoke-tested 1.92s/step (batch 12x5, global 60) that's ~8h.
+    url: /workspace/data/fomo_dwi_subset/train/shard.{000000..000059}.tar
+    samples_per_epoch: 9000
+    shuffle: true
+    buffer_size: 8000
+    drop_last: true
+
+  fomo_val:
+    url: /workspace/data/fomo_dwi_subset/val/shard.{001621..001626}.tar
+    samples_per_epoch: 900
+    shuffle: false
+    buffer_size: 900
+    drop_last: false
+
+checkpoint_period: 20
+max_checkpoints: 1
+
+wandb: true
+wandb_entity: palinaskipar-zdro-tech
+wandb_project: smri-fm-vitl-baseline-4090
