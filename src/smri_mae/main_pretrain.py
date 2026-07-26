@@ -409,11 +409,22 @@ def train_one_epoch(
         if need_update and log_step:
             loss_value = loss_for_log.item()
             grad_norm_value = grad_norm.item()
-            metric_logger.update(loss=loss_value, lr=lr, grad=grad_norm_value)
+            # last_fine_loss is set on every forward_loss call regardless of
+            # coarse_to_fine on/off (see model_mae.py) -- it's the same
+            # quantity the plain model logs as its whole loss, so it's the
+            # fair number to compare against that baseline, unlike `loss`
+            # above which includes the coarse term once coarse_loss_weight
+            # > 0 and so runs on a different scale.
+            fine_loss_module = model.module if args.distributed else model
+            fine_loss_value = fine_loss_module.last_fine_loss.item()
+            metric_logger.update(
+                loss=loss_value, fine_loss=fine_loss_value, lr=lr, grad=grad_norm_value
+            )
             if log_wandb:
                 wandb.log(
                     {
                         "train/loss": loss_value,
+                        "train/fine_loss": fine_loss_value,
                         "train/lr": lr,
                         "train/grad": grad_norm_value,
                     },
@@ -494,6 +505,12 @@ def evaluate(
         if not finite.item():
             raise RuntimeError("non-finite validation loss detected")
         metric_logger.meters["loss"].update(loss_value, n=int(batch["img_mask"].shape[0]))
+        # see train_one_epoch's fine_loss comment: same quantity the plain
+        # model logs as its whole eval loss.
+        fine_loss_module = model.module if args.distributed else model
+        metric_logger.meters["fine_loss"].update(
+            fine_loss_module.last_fine_loss.item(), n=int(batch["img_mask"].shape[0])
+        )
 
         if is_master and batch_step == example_step:
             example_batch = {"image": images[:1], "img_mask": img_mask[:1]}

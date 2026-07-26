@@ -544,6 +544,7 @@ class MaskedAutoencoderViT(nn.Module, PyTorchModelHubMixin):
         self.coarse_to_fine = coarse_to_fine
         self.coarse_factor = coarse_factor
         self.coarse_loss_weight = coarse_loss_weight
+        self.last_fine_loss: Tensor | None = None
         if coarse_to_fine:
             decoder_head = CoarseToFineHead(
                 decoder_embed_dim,
@@ -700,6 +701,14 @@ class MaskedAutoencoderViT(nn.Module, PyTorchModelHubMixin):
         the "sketch it first" part of the loss, on top of the fine-detail
         MSE that always runs. coarse_preds must already be selected/aligned
         the same way preds is (see MaskedAutoencoderViT.forward).
+
+        The fine-only term is also cached on self.last_fine_loss (detached),
+        purely for logging: it's the same quantity the plain model optimizes
+        as its whole loss, so it's the fair, apples-to-apples number to
+        compare against that baseline -- unlike the combined loss returned
+        here (what's actually optimized), which runs on a different scale
+        once coarse_loss_weight > 0. See main_pretrain.py's train_one_epoch
+        for where it gets logged.
         """
         batch_ids, slot_ids = pred_token_mask.nonzero(as_tuple=True)
         patch_ids = pred_ids[batch_ids, slot_ids]
@@ -712,6 +721,7 @@ class MaskedAutoencoderViT(nn.Module, PyTorchModelHubMixin):
         scan_errors = patch_errors.new_zeros(batch_size).scatter_add_(0, batch_ids, patch_errors)
         scan_voxels = patch_voxels.new_zeros(batch_size).scatter_add_(0, batch_ids, patch_voxels)
         fine_loss = (scan_errors / scan_voxels).mean()
+        self.last_fine_loss = fine_loss.detach()
 
         if coarse_preds is None or not self.coarse_to_fine or self.coarse_loss_weight <= 0:
             return fine_loss
