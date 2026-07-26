@@ -15,11 +15,14 @@
 # vitl_edgeloss_4090 runs (which used a reduced 60-shard local cache due
 # to running on a single RTX 4090 with limited local disk), this uses the
 # FULL synced FOMO300+DWI dataset (1620 train / 180 val shards, same
-# range coarse2fine/edgeloss/tome's earlier ViT-S runs used).
+# range coarse2fine/edgeloss/tome's earlier ViT-S runs used) -- this box
+# has the full dataset already on the 3.5TB NVMe drive and 2x GPUs with
+# 96GB each, so no need to subsample.
 #
-# batch_size/accum_iter: confirmed safe up to batch_size=32 via smoke test
-# (peak ~37.7GB on a 96GB GPU); may be increased further once final tuning
-# completes.
+# batch_size/accum_iter: finalized after smoke tests at bs 16/24/32/64 (all
+# completed end-to-end; bs64 peaked at ~69GB, well under the 96GB
+# available). batch_size=64/accum_iter=1 gives global batch 64, matching
+# Mihir's gbs64 baseline recipe on this single GPU.
 
 name: vitl_targetnorm_full
 notes: >
@@ -63,6 +66,8 @@ eval_datasets: [fomo_val]
 
 epochs: 100
 warmup_epochs: 10
+batch_size: 64
+accum_iter: 1
 base_lr: 0.001
 min_lr: 1.0e-06
 weight_decay: 0.05
