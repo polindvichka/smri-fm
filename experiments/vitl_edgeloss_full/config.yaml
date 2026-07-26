@@ -1,0 +1,85 @@
+# Overrides merged on top of src/smri_mae/config/default_pretrain.yaml.
+#
+# Edge-aware loss reweighting (upweights reconstruction loss near
+# high-gradient tissue boundaries relative to flat interior regions) on top
+# of the same ViT-L / full-resolution / FULL FOMO300+DWI data recipe as
+# Mihir's pretrain_full_90_10_h100_4gpu_gbs64 baseline. Single-variable
+# comparison: everything else matches that recipe (model, img_size,
+# patch_size, mask_ratio, epochs, warmup, lr) except model_kwargs.edge_loss_weight.
+#
+# Unlike vitl_edgeloss_4090 (which used a reduced 60-shard local cache due
+# to running on a single RTX 4090 with limited local disk), this uses the
+# FULL synced FOMO300+DWI dataset (1620 train / 180 val shards) on the
+# RTX 6000 box, matching vitl_targetnorm_full / vitl_multiscale_full.
+#
+# batch_size/accum_iter: confirmed safe up to batch_size=32 via smoke test
+# on the plain baseline (peak ~37.7GB on a 96GB GPU); may be increased
+# further once final tuning completes.
+
+name: vitl_edgeloss_full
+notes: >
+  Edge-aware loss reweighting trick applied on top of the same ViT-L /
+  full-resolution / full FOMO300+DWI data recipe as Mihir's
+  pretrain_full_90_10_h100_4gpu_gbs64 baseline. Single-variable comparison:
+  everything else is identical to that baseline recipe.
+
+model: mae_vit_large
+img_size: [208, 240, 208]
+patch_size: 8
+mask_ratio: 0.8
+
+model_kwargs:
+  edge_loss_weight: 2.0
+  decoder_depth: 4
+  reg_tokens: 0
+  class_token: true
+  no_embed_class: false
+  mask_drop_scale: false
+  drop_path_rate: 0.0
+
+output_dir: /mnt/nvme/projects/training-pure-ViT-real-life-bench/checkpoints/experiments/vitl_edgeloss_full
+
+datasets:
+  fomo_train:
+    url: /mnt/nvme/projects/training-pure-ViT-real-life-bench/datasets/FOMO300/wds_with_dwi/shard.{000000..001620}.tar
+    samples_per_epoch: 243200
+    shuffle: true
+    buffer_size: 8000
+    drop_last: true
+  fomo_val:
+    url: /mnt/nvme/projects/training-pure-ViT-real-life-bench/datasets/FOMO300/wds_with_dwi/shard.{001621..001800}.tar
+    samples_per_epoch: 26880
+    shuffle: false
+    buffer_size: 1000
+    drop_last: false
+
+train_dataset: fomo_train
+eval_datasets: [fomo_val]
+
+epochs: 100
+warmup_epochs: 10
+base_lr: 0.001
+min_lr: 1.0e-06
+weight_decay: 0.05
+betas: [0.9, 0.95]
+clip_grad: 1.0
+
+amp: true
+amp_dtype: bfloat16
+
+num_workers: 8
+prefetch_factor: 2
+presend_cuda: true
+
+checkpoint_period: 5
+max_checkpoints: 3
+
+hf_repo_id: pau99/fomo26-checkpoints
+hf_subfolder: smri-fm-vitl-fulldata/edgeloss
+
+wandb: true
+wandb_entity: palinaskipar-zdro-tech
+wandb_project: smri-fm-vitl-fulldata
+
+seed: 7338
+eval_seed: 7338
