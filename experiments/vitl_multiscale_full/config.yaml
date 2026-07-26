@@ -18,9 +18,10 @@
 # pretrain_full_90_10_h100_4gpu_gbs64 baseline): same img_size, patch_size,
 # mask_ratio, epochs, warmup, lr, full FOMO300+DWI dataset.
 #
-# batch_size/accum_iter: confirmed safe up to batch_size=32 via smoke test
-# (peak ~37.8GB on a 96GB GPU, essentially identical to targetnorm's
-# footprint); may be increased further once final tuning completes.
+# batch_size/accum_iter: finalized after smoke tests at bs 16/24/32/64 (all
+# completed end-to-end; bs64 peaked at ~69.5GB, well under the 96GB
+# available). batch_size=64/accum_iter=1 gives global batch 64, matching
+# Mihir's gbs64 baseline recipe on this single GPU.
 
 name: vitl_multiscale_full
 notes: >
@@ -65,6 +66,8 @@ eval_datasets: [fomo_val]
 
 epochs: 100
 warmup_epochs: 10
+batch_size: 64
+accum_iter: 1
 base_lr: 0.001
 min_lr: 1.0e-06
 weight_decay: 0.05
