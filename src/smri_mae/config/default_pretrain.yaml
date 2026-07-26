@@ -23,6 +23,14 @@ model_kwargs:
   # target normalization: null/none, global, slice, or patch.
   target_norm: none
 
+  # coarse-to-fine decoding: guess each masked patch's block-averaged shape
+  # first, then predict a fine residual on top of it, instead of predicting
+  # all voxels in one shot. coarse_to_fine: false reproduces the original
+  # unmodified decoder head exactly.
+  coarse_to_fine: false
+  coarse_factor: 2
+  coarse_loss_weight: 1.0
+
   no_decode_pos: false
   mask_drop_scale: false
 

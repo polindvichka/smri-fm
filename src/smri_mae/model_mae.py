@@ -27,12 +27,14 @@ from jaxtyping import Float, Int
 from .modules import (
     AbsolutePosEmbed,
     Block,
+    CoarseToFineHead,
     LayerNorm,
     Normalize,
     JaggedBatch,
     Patchify3D,
     SeparablePosEmbed,
     SinCosPosEmbed3D,
+    avgpool_patch3d,
     unpack_tokens,
 )
 from .masking import pad_patch_mask
@@ -177,7 +179,7 @@ class MaskedEncoder(nn.Module):
         Tensor | None,
     ]:
         """
-        x: input data shape [B, C, D, H, W] 
+        x: input data shape [B, C, D, H, W]
         mask: visible mask, 1 = visible, 0 = invisible. broadcastable shape
         mask_ratio: mask ratio for uniform random masking
 
@@ -479,6 +481,9 @@ class MaskedAutoencoderViT(nn.Module, PyTorchModelHubMixin):
         no_decode_pos: bool = False,
         pos_embed: Literal["abs", "sep", "sincos"] = "sincos",
         target_norm: Literal["none", "global", "slice", "patch"] | None = None,
+        coarse_to_fine: bool = False,
+        coarse_factor: int = 2,
+        coarse_loss_weight: float = 1.0,
     ):
         super().__init__()
         img_size = _to_3d_tuple(img_size, "img_size")
@@ -529,7 +534,25 @@ class MaskedAutoencoderViT(nn.Module, PyTorchModelHubMixin):
         decoder_pos_embed = pos_embed_layer(decoder_embed_dim, self.pred_patchify.grid_size)
         # we might want to try tying the weights of the prediction head to the patch
         # embedding at some point.
-        decoder_head = nn.Linear(decoder_embed_dim, self.pred_patchify.patch_dim)
+        #
+        # coarse-to-fine: guess each patch's block-averaged shape first, then
+        # predict a fine residual on top of it, instead of predicting all
+        # voxels in one shot. coarse_to_fine=False (default) keeps the
+        # original plain nn.Linear head byte-for-byte, so it's the same
+        # baseline recipe as the plain model (coarse_loss_weight has no
+        # effect when this is off).
+        self.coarse_to_fine = coarse_to_fine
+        self.coarse_factor = coarse_factor
+        self.coarse_loss_weight = coarse_loss_weight
+        if coarse_to_fine:
+            decoder_head = CoarseToFineHead(
+                decoder_embed_dim,
+                self.pred_patchify.patch_size,
+                in_chans,
+                coarse_factor=coarse_factor,
+            )
+        else:
+            decoder_head = nn.Linear(decoder_embed_dim, self.pred_patchify.patch_dim)
 
         self.decoder = MaskedDecoder(
             pos_embed=decoder_pos_embed,
@@ -560,7 +583,10 @@ class MaskedAutoencoderViT(nn.Module, PyTorchModelHubMixin):
         self.init_weights()
 
     def extra_repr(self):
-        return f"no_decode_pos={self.no_decode_pos}"
+        return (
+            f"no_decode_pos={self.no_decode_pos}, coarse_to_fine={self.coarse_to_fine}, "
+            f"coarse_factor={self.coarse_factor}, coarse_loss_weight={self.coarse_loss_weight}"
+        )
 
     def init_weights(self):
         self.apply(_init_weights)
@@ -664,8 +690,17 @@ class MaskedAutoencoderViT(nn.Module, PyTorchModelHubMixin):
         pred_mask_patches: Float[Tensor, "B N P"],
         pred_ids: Int[Tensor, "B Q"],
         pred_token_mask: Tensor,
+        coarse_preds: Float[Tensor, "T Pc"] | None = None,
     ) -> Tensor:
-        """Average valid-voxel MSE within each scan, then average across scans."""
+        """Average valid-voxel MSE within each scan, then average across scans.
+
+        When coarse_preds is given (coarse_to_fine=True), also scores the
+        decoder head's coarse ("big shape") guess against a block-averaged
+        version of the same target, and adds that in as a second term --
+        the "sketch it first" part of the loss, on top of the fine-detail
+        MSE that always runs. coarse_preds must already be selected/aligned
+        the same way preds is (see MaskedAutoencoderViT.forward).
+        """
         batch_ids, slot_ids = pred_token_mask.nonzero(as_tuple=True)
         patch_ids = pred_ids[batch_ids, slot_ids]
         targets = targets_patches[batch_ids, patch_ids]
@@ -674,13 +709,31 @@ class MaskedAutoencoderViT(nn.Module, PyTorchModelHubMixin):
         patch_errors = ((preds - targets) ** 2 * voxel_mask).sum(dim=1)
         patch_voxels = voxel_mask.sum(dim=1).to(dtype=patch_errors.dtype)
         batch_size = targets_patches.shape[0]
-        scan_errors = patch_errors.new_zeros(batch_size).scatter_add_(
-            0, batch_ids, patch_errors
+        scan_errors = patch_errors.new_zeros(batch_size).scatter_add_(0, batch_ids, patch_errors)
+        scan_voxels = patch_voxels.new_zeros(batch_size).scatter_add_(0, batch_ids, patch_voxels)
+        fine_loss = (scan_errors / scan_voxels).mean()
+
+        if coarse_preds is None or not self.coarse_to_fine or self.coarse_loss_weight <= 0:
+            return fine_loss
+
+        factor = self.coarse_factor
+        in_chans = self.pred_patchify.in_chans
+        coarse_targets = avgpool_patch3d(targets, self.pred_patchify.patch_size, in_chans, factor)
+        coarse_voxel_mask = avgpool_patch3d(
+            voxel_mask.to(targets.dtype), self.pred_patchify.patch_size, in_chans, factor
         )
-        scan_voxels = patch_voxels.new_zeros(batch_size).scatter_add_(
-            0, batch_ids, patch_voxels
+
+        coarse_errors = ((coarse_preds - coarse_targets) ** 2 * coarse_voxel_mask).sum(dim=1)
+        coarse_voxels = coarse_voxel_mask.sum(dim=1).to(dtype=coarse_errors.dtype)
+        scan_coarse_errors = coarse_errors.new_zeros(batch_size).scatter_add_(
+            0, batch_ids, coarse_errors
         )
-        return (scan_errors / scan_voxels).mean()
+        scan_coarse_voxels = coarse_voxels.new_zeros(batch_size).scatter_add_(
+            0, batch_ids, coarse_voxels
+        )
+        coarse_loss = (scan_coarse_errors / scan_coarse_voxels.clamp(min=1.0)).mean()
+
+        return fine_loss + self.coarse_loss_weight * coarse_loss
 
     @torch.no_grad()
     def forward_pred_images(
@@ -757,12 +810,24 @@ class MaskedAutoencoderViT(nn.Module, PyTorchModelHubMixin):
         )
 
         loss_preds = preds if not with_state else preds[pred_token_mask]
+
+        # CoarseToFineHead stashes its coarse ("big shape") guess as a side
+        # effect of the self.head(...) call inside forward_decoder above,
+        # already aligned 1:1 with `preds` (same shape, same ordering) since
+        # it ran on exactly the same input. Select it the same way loss_preds
+        # was selected so forward_loss can index both with the same ids.
+        coarse_preds = None
+        if self.coarse_to_fine:
+            raw_coarse_preds = self.decoder.head.last_coarse_pred
+            coarse_preds = raw_coarse_preds if not with_state else raw_coarse_preds[pred_token_mask]
+
         loss = self.forward_loss(
             loss_preds,
             targets_patches,
             pred_mask_patches,
             pred_ids,
             pred_token_mask,
+            coarse_preds=coarse_preds,
         )
 
         if not with_state:
