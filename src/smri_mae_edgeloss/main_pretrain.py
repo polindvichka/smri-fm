@@ -11,6 +11,7 @@ import json
 import math
 import random
 import subprocess
+import threading
 import time
 from contextlib import nullcontext
 from functools import partial
@@ -182,9 +183,10 @@ def main(args: DictConfig):
                 plot_name = plot_name.replace("/", "__")
                 img.save(output_dir / f"{plot_name}__{epoch:05d}.png")
 
+        _wait_for_hf_upload()
         ut.save_model(args, epoch, model_without_ddp, optimizer, loss_scaler)
         sync_checkpoints_to_r2(args, output_dir)
-        sync_checkpoints_to_hf(args, output_dir)
+        sync_checkpoints_to_hf(args, output_dir, wait=(epoch == args.epochs - 1))
 
     if args.distributed:
         torch.distributed.destroy_process_group()
@@ -249,44 +251,81 @@ def sync_checkpoints_to_r2(args: DictConfig, output_dir: Path) -> None:
     subprocess.run(cmd, check=True)
 
 
-def sync_checkpoints_to_hf(args: DictConfig, output_dir: Path) -> None:
+_hf_upload_thread: threading.Thread | None = None
+
+
+def _wait_for_hf_upload() -> None:
+    """Block until any in-flight HF Hub upload thread finishes. Call this
+    before anything that might delete or overwrite a local checkpoint file
+    (e.g. save_model's max_checkpoints rotation), so a background upload
+    never reads a file out from under itself. In the common case the
+    previous upload already finished well before the next checkpoint_period
+    rolls around, so this is a no-op wait, not a real stall.
+    """
+    global _hf_upload_thread
+    if _hf_upload_thread is not None:
+        _hf_upload_thread.join()
+        _hf_upload_thread = None
+
+
+def sync_checkpoints_to_hf(args: DictConfig, output_dir: Path, wait: bool = False) -> None:
     """Upload output_dir (checkpoint + config/log/eval files) to the HF Hub
-    repo/subfolder named by hf_repo_id/hf_subfolder, then delete any epoch
-    checkpoints on the Hub that are no longer kept locally (mirrors the
-    max_checkpoints cleanup save_model already did), so at most
-    max_checkpoints epoch checkpoints -- typically just one -- ever live on
-    the Hub. Blocking, like sync_checkpoints_to_r2: a run that finishes right
-    after this call must not exit before the final checkpoint's upload lands.
+    repo/subfolder named by hf_repo_id/hf_subfolder in a background thread,
+    then delete any epoch checkpoints on the Hub that are no longer kept
+    locally (mirrors the max_checkpoints cleanup save_model already did), so
+    at most max_checkpoints epoch checkpoints -- typically just one -- ever
+    live on the Hub.
+
+    Non-blocking by default, so training isn't stalled waiting for a ~4GB
+    upload every checkpoint_period epochs. Pass wait=True (done automatically
+    on the final epoch, see main()) to block until this specific upload
+    completes, so the last checkpoint's upload can't be lost when the
+    process exits. Callers must call _wait_for_hf_upload() before this
+    epoch's save_model() runs (see main()) -- see _wait_for_hf_upload's
+    docstring for why.
+
+    Only uploads checkpoint-{epoch}.pth, not checkpoint-last.pth -- the two
+    are byte-identical (save_model writes the same state dict to both, the
+    latter purely for local auto-resume convenience), so uploading both
+    would double the transfer for no reason.
+
     No-op if hf_repo_id isn't set.
     """
+    global _hf_upload_thread
     hf_repo_id = args.get("hf_repo_id")
     if not hf_repo_id or not ut.is_main_process():
         return
 
-    from huggingface_hub import HfApi
+    def _upload():
+        from huggingface_hub import HfApi
 
-    api = HfApi()
-    subfolder = args.get("hf_subfolder") or args.name
+        api = HfApi()
+        subfolder = args.get("hf_subfolder") or args.name
 
-    print(f"syncing checkpoints to HF Hub: {output_dir} -> {hf_repo_id}/{subfolder}")
-    api.upload_folder(
-        folder_path=str(output_dir),
-        path_in_repo=subfolder,
-        repo_id=hf_repo_id,
-        repo_type="model",
-        allow_patterns=["checkpoint-*.pth", "*.yaml", "*.json", "*.txt", "*.png"],
-    )
+        print(f"syncing checkpoints to HF Hub: {output_dir} -> {hf_repo_id}/{subfolder}")
+        api.upload_folder(
+            folder_path=str(output_dir),
+            path_in_repo=subfolder,
+            repo_id=hf_repo_id,
+            repo_type="model",
+            allow_patterns=["checkpoint-[0-9]*.pth", "*.yaml", "*.json", "*.txt", "*.png"],
+        )
 
-    kept_names = {p.name for p in output_dir.glob("checkpoint-[0-9]*.pth")}
-    kept_names.add("checkpoint-last.pth")
-    prefix = f"{subfolder}/"
-    for remote_path in api.list_repo_files(hf_repo_id, repo_type="model"):
-        if not remote_path.startswith(prefix):
-            continue
-        name = remote_path[len(prefix) :]
-        if name.startswith("checkpoint-") and name.endswith(".pth") and name not in kept_names:
-            print(f"removing superseded checkpoint from HF Hub: {remote_path}")
-            api.delete_file(path_in_repo=remote_path, repo_id=hf_repo_id, repo_type="model")
+        kept_names = {p.name for p in output_dir.glob("checkpoint-[0-9]*.pth")}
+        prefix = f"{subfolder}/"
+        for remote_path in api.list_repo_files(hf_repo_id, repo_type="model"):
+            if not remote_path.startswith(prefix):
+                continue
+            name = remote_path[len(prefix) :]
+            if name.startswith("checkpoint-") and name.endswith(".pth") and name not in kept_names:
+                print(f"removing superseded checkpoint from HF Hub: {remote_path}")
+                api.delete_file(path_in_repo=remote_path, repo_id=hf_repo_id, repo_type="model")
+
+    _hf_upload_thread = threading.Thread(target=_upload, daemon=False)
+    _hf_upload_thread.start()
+    if wait:
+        _hf_upload_thread.join()
+        _hf_upload_thread = None
 
 
 def train_one_epoch(
@@ -315,7 +354,9 @@ def train_one_epoch(
     amp_dtype = getattr(torch, args.amp_dtype)
     use_cuda = device.type == "cuda"
     if use_cuda and args.presend_cuda:
-        data_loader = ut.pre_send_to_cuda_wrapper(data_loader, device, dtype_map={torch.float16: amp_dtype})
+        data_loader = ut.pre_send_to_cuda_wrapper(
+            data_loader, device, dtype_map={torch.float16: amp_dtype}
+        )
 
     optimizer.zero_grad()
 
@@ -417,7 +458,9 @@ def evaluate(
     if use_cuda:
         torch.cuda.manual_seed(eval_seed)
     if use_cuda and args.presend_cuda:
-        data_loader = ut.pre_send_to_cuda_wrapper(data_loader, device, dtype_map={torch.float16: amp_dtype})
+        data_loader = ut.pre_send_to_cuda_wrapper(
+            data_loader, device, dtype_map={torch.float16: amp_dtype}
+        )
 
     eval_batches = islice(data_loader, num_batches)
     for batch_idx, batch in enumerate(
@@ -445,9 +488,7 @@ def evaluate(
             )
 
         loss_value = loss.detach().float().item()
-        finite = torch.tensor(
-            int(math.isfinite(loss_value)), dtype=torch.int32, device=device
-        )
+        finite = torch.tensor(int(math.isfinite(loss_value)), dtype=torch.int32, device=device)
         if args.distributed:
             torch.distributed.all_reduce(finite, op=torch.distributed.ReduceOp.MIN)
         if not finite.item():
@@ -517,6 +558,7 @@ def make_plots(
     plt.close(mask_pred_fig)
 
     return plots
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
