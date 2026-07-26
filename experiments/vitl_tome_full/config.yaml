@@ -13,9 +13,11 @@
 # FULL synced FOMO300+DWI dataset (1620 train / 180 val shards) on the
 # RTX 6000 box, matching vitl_targetnorm_full / vitl_multiscale_full.
 #
-# batch_size/accum_iter: confirmed safe up to batch_size=32 via smoke test
-# on the plain baseline (peak ~37.7GB on a 96GB GPU); may be increased
-# further once final tuning completes.
+# batch_size/accum_iter: finalized after smoke tests at bs 16/24/32/64 on the
+# plain baseline (all completed end-to-end; bs64 peaked at ~69GB, well under
+# the 96GB available). batch_size=64/accum_iter=1 gives global batch 64,
+# matching Mihir's gbs64 baseline recipe on this single GPU -- same value
+# as vitl_targetnorm_full / vitl_multiscale_full.
 
 name: vitl_tome_full
 notes: >
@@ -59,6 +61,8 @@ eval_datasets: [fomo_val]
 
 epochs: 100
 warmup_epochs: 10
+batch_size: 64
+accum_iter: 1
 base_lr: 0.001
 min_lr: 1.0e-06
 weight_decay: 0.05
