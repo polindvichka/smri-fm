@@ -60,6 +60,7 @@ class MaskedEncoder(nn.Module):
         final_norm: bool = True,
         drop_path_rate: float = 0.0,
         mask_drop_scale: bool = False,
+        multiscale_layers: Sequence[int] | None = None,
     ):
         super().__init__()
         self.num_prefix_tokens = int(class_token) + reg_tokens
@@ -105,6 +106,18 @@ class MaskedEncoder(nn.Module):
         )
 
         self.norm = LayerNorm(embed_dim) if final_norm else nn.Identity()
+
+        # Optional multi-scale decoder input: fuse several intermediate block
+        # outputs (0-indexed, in addition to whichever is last) instead of
+        # feeding the decoder only the final block's output. None/empty
+        # preserves the original single-layer behavior exactly (see
+        # forward_patch_embeds) -- this is purely additive.
+        self.multiscale_layers = sorted(set(multiscale_layers)) if multiscale_layers else None
+        if self.multiscale_layers:
+            self.multiscale_norms = nn.ModuleList(
+                [LayerNorm(embed_dim) for _ in self.multiscale_layers]
+            )
+            self.multiscale_fuse = nn.Linear(len(self.multiscale_layers) * embed_dim, embed_dim)
 
         self.reset_parameters()
 
@@ -177,7 +190,7 @@ class MaskedEncoder(nn.Module):
         Tensor | None,
     ]:
         """
-        x: input data shape [B, C, D, H, W] 
+        x: input data shape [B, C, D, H, W]
         mask: visible mask, 1 = visible, 0 = invisible. broadcastable shape
         mask_ratio: mask ratio for uniform random masking
 
@@ -254,9 +267,23 @@ class MaskedEncoder(nn.Module):
         token_mask = self.cat_token_mask(token_mask, B)
         jagged_batch = JaggedBatch.from_mask(token_mask)
         x = x[token_mask]
-        for block in self.blocks:
-            x = block(x, jagged_batch=jagged_batch)
-        x = self.norm(x)
+
+        if self.multiscale_layers:
+            taps = []
+            for ii, block in enumerate(self.blocks):
+                x = block(x, jagged_batch=jagged_batch)
+                if ii in self.multiscale_layers:
+                    taps.append(x)
+            # all taps share the same packed token order (masking/packing is
+            # fixed for this forward call), so a per-token feature-dim concat
+            # lines up correctly without any unpacking in between.
+            normed_taps = [norm(tap) for norm, tap in zip(self.multiscale_norms, taps)]
+            x = self.multiscale_fuse(torch.cat(normed_taps, dim=-1))
+        else:
+            for block in self.blocks:
+                x = block(x, jagged_batch=jagged_batch)
+            x = self.norm(x)
+
         x = unpack_tokens(x, token_mask)
 
         cls_embeds, reg_embeds, patch_embeds = self.chunk_tokens(x)
@@ -479,6 +506,7 @@ class MaskedAutoencoderViT(nn.Module, PyTorchModelHubMixin):
         no_decode_pos: bool = False,
         pos_embed: Literal["abs", "sep", "sincos"] = "sincos",
         target_norm: Literal["none", "global", "slice", "patch"] | None = None,
+        multiscale_layers: Sequence[int] | None = None,
     ):
         super().__init__()
         img_size = _to_3d_tuple(img_size, "img_size")
@@ -518,6 +546,7 @@ class MaskedAutoencoderViT(nn.Module, PyTorchModelHubMixin):
             no_embed_class=no_embed_class,
             drop_path_rate=drop_path_rate,
             mask_drop_scale=mask_drop_scale,
+            multiscale_layers=multiscale_layers,
         )
 
         self.pred_patchify = patchify
@@ -674,12 +703,8 @@ class MaskedAutoencoderViT(nn.Module, PyTorchModelHubMixin):
         patch_errors = ((preds - targets) ** 2 * voxel_mask).sum(dim=1)
         patch_voxels = voxel_mask.sum(dim=1).to(dtype=patch_errors.dtype)
         batch_size = targets_patches.shape[0]
-        scan_errors = patch_errors.new_zeros(batch_size).scatter_add_(
-            0, batch_ids, patch_errors
-        )
-        scan_voxels = patch_voxels.new_zeros(batch_size).scatter_add_(
-            0, batch_ids, patch_voxels
-        )
+        scan_errors = patch_errors.new_zeros(batch_size).scatter_add_(0, batch_ids, patch_errors)
+        scan_voxels = patch_voxels.new_zeros(batch_size).scatter_add_(0, batch_ids, patch_voxels)
         return (scan_errors / scan_voxels).mean()
 
     @torch.no_grad()
