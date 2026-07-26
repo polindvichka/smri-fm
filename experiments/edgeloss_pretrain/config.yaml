@@ -1,4 +1,4 @@
-# Overrides merged on top of src/smri_mae_edgeloss/config/default_pretrain.yaml
+# Overrides merged on top of src/smri_mae/config/default_pretrain.yaml
 # (main_pretrain.py --cfg-path). Same comparability decisions as the sibling
 # ToMe experiment (see /workspace/smri-fm-tome/experiments/tome_pretrain/):
 # mae_vit_small (not the 316M-param default mae_vit_large) to stay in the
@@ -14,7 +14,7 @@ notes: >
   voxels near high-gradient tissue boundaries relative to flat interior
   regions, so the model is pushed to get anatomical boundaries right instead
   of coasting on easy flat regions that dominate by voxel count.
-  See src/smri_mae_edgeloss/model_mae.py (prepare_edge_weights,
+  See src/smri_mae/model_mae.py (prepare_edge_weights,
   gradient_magnitude_3d). edge_loss_weight=0 reproduces the unweighted MAE
   loss exactly (verified bit-identical against the original smri_mae code).
 

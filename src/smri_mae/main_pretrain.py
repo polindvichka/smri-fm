@@ -196,6 +196,13 @@ def main(args: DictConfig):
 
 
 def create_data_loaders(args: DictConfig):
+    if args.datasets[args.train_dataset].get("format") == "local_pt":
+        # Local-disk .pt files instead of real webdataset shards -- see
+        # experiments/edgeloss_pretrain/README.md and src/data/local_pt_dataset.py.
+        from data.local_pt_dataset import create_local_data_loaders
+
+        return create_local_data_loaders(args)
+
     data_loaders = {}
     dataset_names = [args.train_dataset] + args.eval_datasets
 

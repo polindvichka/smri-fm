@@ -38,6 +38,22 @@ from .modules import (
 from .masking import pad_patch_mask
 
 
+def gradient_magnitude_3d(x: Tensor) -> Tensor:
+    """
+    Central-difference intensity-gradient magnitude, same shape as input.
+    Used as an edge-aware loss weight: large where the volume has a tissue
+    boundary (e.g. gray/white matter interfaces, ventricle walls), small in
+    flat, easy-to-interpolate interior regions.
+
+    x: [B, C, D, H, W]
+    """
+    x = F.pad(x, (1, 1, 1, 1, 1, 1), mode="replicate")
+    gd = x[:, :, 2:, 1:-1, 1:-1] - x[:, :, :-2, 1:-1, 1:-1]
+    gh = x[:, :, 1:-1, 2:, 1:-1] - x[:, :, 1:-1, :-2, 1:-1]
+    gw = x[:, :, 1:-1, 1:-1, 2:] - x[:, :, 1:-1, 1:-1, :-2]
+    return torch.sqrt(gd**2 + gh**2 + gw**2 + 1e-8)
+
+
 class MaskedEncoder(nn.Module):
     """
     Masked transformer encoder.
@@ -177,7 +193,7 @@ class MaskedEncoder(nn.Module):
         Tensor | None,
     ]:
         """
-        x: input data shape [B, C, D, H, W] 
+        x: input data shape [B, C, D, H, W]
         mask: visible mask, 1 = visible, 0 = invisible. broadcastable shape
         mask_ratio: mask ratio for uniform random masking
 
@@ -479,6 +495,7 @@ class MaskedAutoencoderViT(nn.Module, PyTorchModelHubMixin):
         no_decode_pos: bool = False,
         pos_embed: Literal["abs", "sep", "sincos"] = "sincos",
         target_norm: Literal["none", "global", "slice", "patch"] | None = None,
+        edge_loss_weight: float = 2.0,
     ):
         super().__init__()
         img_size = _to_3d_tuple(img_size, "img_size")
@@ -557,10 +574,16 @@ class MaskedAutoencoderViT(nn.Module, PyTorchModelHubMixin):
         else:
             self.target_norm = None
 
+        # edge-aware loss reweighting: boost the loss at tissue boundaries
+        # (high local intensity gradient) relative to flat interior regions,
+        # so the model is pushed to get anatomical boundaries right instead
+        # of being dominated by easy, low-information flat voxels.
+        self.edge_loss_weight = edge_loss_weight
+
         self.init_weights()
 
     def extra_repr(self):
-        return f"no_decode_pos={self.no_decode_pos}"
+        return f"no_decode_pos={self.no_decode_pos}, edge_loss_weight={self.edge_loss_weight}"
 
     def init_weights(self):
         self.apply(_init_weights)
@@ -585,6 +608,39 @@ class MaskedAutoencoderViT(nn.Module, PyTorchModelHubMixin):
             targets_stats = None
 
         return targets_patches, targets_stats
+
+    def prepare_edge_weights(
+        self,
+        images: Tensor,
+        img_mask: Tensor | None,
+    ) -> Tensor | None:
+        """
+        Per-voxel loss weights derived from local intensity-gradient magnitude,
+        patchified to align with targets_patches. Voxels near tissue boundaries
+        (high gradient) get upweighted relative to flat interior regions, whose
+        mean weight is normalized to ~1 so the overall loss scale is unchanged.
+
+        images: [B, C, D, H, W]
+        img_mask: same shape, used to exclude background from the normalization
+            stats (does not affect which voxels are scored -- that's pred_mask).
+        """
+        if not self.edge_loss_weight:
+            return None
+
+        grad_mag = gradient_magnitude_3d(images)  # [B, C, D, H, W]
+        grad_patches = self.pred_patchify(grad_mag)  # [B, N, P]
+
+        if img_mask is not None:
+            mask_patches = self.pred_patchify(img_mask).to(grad_patches.dtype)
+            num_obs = mask_patches.sum(dim=(1, 2)).clamp(min=1.0)
+            mean_grad = (grad_patches * mask_patches).sum(dim=(1, 2)) / num_obs
+        else:
+            mean_grad = grad_patches.mean(dim=(1, 2))
+
+        mean_grad = mean_grad.clamp(min=1e-6).view(-1, 1, 1)
+        normalized_grad = grad_patches / mean_grad
+        edge_weights = 1.0 + self.edge_loss_weight * normalized_grad
+        return edge_weights
 
     def prepare_masks(
         self,
@@ -664,22 +720,30 @@ class MaskedAutoencoderViT(nn.Module, PyTorchModelHubMixin):
         pred_mask_patches: Float[Tensor, "B N P"],
         pred_ids: Int[Tensor, "B Q"],
         pred_token_mask: Tensor,
+        edge_weights_patches: Float[Tensor, "B N P"] | None = None,
     ) -> Tensor:
-        """Average valid-voxel MSE within each scan, then average across scans."""
+        """Average valid-voxel MSE within each scan, then average across scans.
+
+        When edge_weights_patches is given, voxels are weighted by local
+        intensity-gradient magnitude (tissue boundaries) before averaging, so
+        the loss emphasizes edges over flat, easy-to-interpolate interior
+        regions instead of treating every voxel equally.
+        """
         batch_ids, slot_ids = pred_token_mask.nonzero(as_tuple=True)
         patch_ids = pred_ids[batch_ids, slot_ids]
         targets = targets_patches[batch_ids, patch_ids]
         voxel_mask = pred_mask_patches[batch_ids, patch_ids]
 
-        patch_errors = ((preds - targets) ** 2 * voxel_mask).sum(dim=1)
-        patch_voxels = voxel_mask.sum(dim=1).to(dtype=patch_errors.dtype)
+        if edge_weights_patches is not None:
+            voxel_weight = voxel_mask * edge_weights_patches[batch_ids, patch_ids]
+        else:
+            voxel_weight = voxel_mask
+
+        patch_errors = ((preds - targets) ** 2 * voxel_weight).sum(dim=1)
+        patch_voxels = voxel_weight.sum(dim=1).to(dtype=patch_errors.dtype)
         batch_size = targets_patches.shape[0]
-        scan_errors = patch_errors.new_zeros(batch_size).scatter_add_(
-            0, batch_ids, patch_errors
-        )
-        scan_voxels = patch_voxels.new_zeros(batch_size).scatter_add_(
-            0, batch_ids, patch_voxels
-        )
+        scan_errors = patch_errors.new_zeros(batch_size).scatter_add_(0, batch_ids, patch_errors)
+        scan_voxels = patch_voxels.new_zeros(batch_size).scatter_add_(0, batch_ids, patch_voxels)
         return (scan_errors / scan_voxels).mean()
 
     @torch.no_grad()
@@ -725,6 +789,7 @@ class MaskedAutoencoderViT(nn.Module, PyTorchModelHubMixin):
             device=images.device,
         )
         targets_patches, targets_stats = self.prepare_targets(images, img_mask)
+        edge_weights_patches = self.prepare_edge_weights(images, img_mask)
 
         (
             cls_embeds,
@@ -763,6 +828,7 @@ class MaskedAutoencoderViT(nn.Module, PyTorchModelHubMixin):
             pred_mask_patches,
             pred_ids,
             pred_token_mask,
+            edge_weights_patches=edge_weights_patches,
         )
 
         if not with_state:

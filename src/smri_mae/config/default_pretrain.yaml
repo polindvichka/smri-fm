@@ -23,6 +23,11 @@ model_kwargs:
   # target normalization: null/none, global, slice, or patch.
   target_norm: none
 
+  # edge-aware loss reweighting: upweight voxels at high-gradient tissue
+  # boundaries relative to flat interior regions. 0 disables (falls back to
+  # plain unweighted MSE, matching the original smri_mae recipe).
+  edge_loss_weight: 2.0
+
   no_decode_pos: false
   mask_drop_scale: false
 

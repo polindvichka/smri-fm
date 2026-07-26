@@ -1,4 +1,4 @@
-# Overrides merged on top of src/smri_mae_edgeloss/config/default_pretrain.yaml
+# Overrides merged on top of src/smri_mae/config/default_pretrain.yaml
 # (main_pretrain.py --cfg-path). Identical to the sibling repos' vitl_baseline_4090
 # / vitl_coarse2fine_4090 configs in every respect except model_kwargs.edge_loss_weight
 # -- this repo's model_mae.py is otherwise the same as the plain baseline's, just
@@ -19,7 +19,7 @@ notes: >
   on top of the same ViT-L / full-resolution / FOMO300+DWI baseline recipe
   as vitl_baseline_4090. Single-variable comparison: everything else is
   identical to that baseline run. edge_loss_weight: 2.0 is already this
-  repo's default (see src/smri_mae_edgeloss/config/default_pretrain.yaml),
+  repo's default (see src/smri_mae/config/default_pretrain.yaml),
   included explicitly below just for clarity/documentation.
 
 model_kwargs:

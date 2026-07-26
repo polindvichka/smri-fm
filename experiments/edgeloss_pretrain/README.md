@@ -3,7 +3,7 @@
 Upweights voxels near high-gradient tissue boundaries relative to flat
 interior regions in the MAE reconstruction loss, so the model is pushed to
 get anatomical boundaries right instead of coasting on easy flat regions
-that dominate by voxel count. Implementation: `src/smri_mae_edgeloss/`, an
+that dominate by voxel count. Implementation: `src/smri_mae/`, an
 isolated copy of `smri_mae` (only `model_mae.py`'s `gradient_magnitude_3d`/
 `prepare_edge_weights`/`forward_loss`, `config/default_pretrain.yaml`, and
 `main_pretrain.py`'s three import lines differ — everything else is a
@@ -31,7 +31,7 @@ again here — and compare both experiments against that single run.
 ## Running for real
 
 ```sh
-uv run python src/smri_mae_edgeloss/main_pretrain.py \
+uv run python src/smri_mae/main_pretrain.py \
   --cfg-path experiments/edgeloss_pretrain/config.yaml
 ```
 

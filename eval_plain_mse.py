@@ -11,6 +11,7 @@ runs the exact same eval code path (same masking, same eval_seed, same val
 data) that produced the baseline/coarse2fine numbers -- just with one setting
 flipped.
 """
+
 import sys
 from pathlib import Path
 
@@ -19,8 +20,7 @@ from omegaconf import OmegaConf
 
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
-import smri_mae_edgeloss.main_pretrain as mp
-import smri_mae_edgeloss.utils as ut
+import smri_mae.main_pretrain as mp
 
 CKPT_DIR = Path("checkpoints/experiments/vitl_edgeloss_4090")
 
@@ -43,7 +43,9 @@ model = mp.MODELS_DICT[args.model](
 model.to(device)
 
 ckpt_path = CKPT_DIR / "checkpoint-00099.pth"
-print(f"loading trained weights from {ckpt_path} (weights unchanged, only the loss-time setting above differs)...")
+print(
+    f"loading trained weights from {ckpt_path} (weights unchanged, only the loss-time setting above differs)..."
+)
 ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
 model.load_state_dict(ckpt["model"])
 
