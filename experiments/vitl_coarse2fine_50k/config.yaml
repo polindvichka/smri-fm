@@ -1,0 +1,101 @@
+# Overrides merged on top of src/smri_mae/config/default_pretrain.yaml.
+#
+# Same coarse-to-fine decoding recipe as vitl_coarse2fine_full, but scaled
+# down to a ~50k-sample training set instead of the full FOMO300+DWI data
+# (270k+ samples). Meant to run after the current vitl_baseline_full /
+# vitl_multiscale_full jobs finish on the full dataset, as a faster
+# lower-data comparison point rather than a replacement for the full run.
+#
+# Dataset sizing (shards hold ~150 samples each, same as the full recipe):
+# - train: shards 000000-000333 (334 shards, ~50100-sample capacity),
+#   samples_per_epoch capped at 50000.
+# - val: shards 001621-001657 (37 shards, ~5550-sample capacity),
+#   samples_per_epoch capped at 5500 -- keeps the same ~11% val ratio as
+#   the full recipe (26880/243200), and is a SUBSET of the exact held-out
+#   val shard range (001621-001800) already used by vitl_baseline_full /
+#   vitl_multiscale_full / vitl_targetnorm_full / vitl_coarse2fine_full, so
+#   it never overlaps with any train range (full or reduced) and eval
+#   losses stay comparable across all experiments.
+#
+# Everything else (model, img_size, patch_size, mask_ratio, epochs, warmup,
+# lr, batch_size) is unchanged from vitl_coarse2fine_full -- main variable
+# here is dataset scale. Adjust epochs/warmup if you want total sample
+# exposure to match the full run rather than epoch count.
+#
+# eval_period: 5 (default_pretrain.yaml default is 10) -- evals every 5
+# epochs instead of every 10 for this smaller/faster run. baseline_full and
+# multiscale_full (currently running) are intentionally left on the
+# default 10 and NOT being changed.
+
+name: vitl_coarse2fine_50k
+notes: >
+  Coarse-to-fine decoding trick, same as vitl_coarse2fine_full, but on a
+  ~50k-sample subset of FOMO300+DWI (shards 000000-000333) instead of the
+  full dataset. Val set (shards 001621-001657) is a subset of the same
+  held-out range used by the full-scale experiments.
+
+model: mae_vit_large
+img_size: [208, 240, 208]
+patch_size: 8
+mask_ratio: 0.8
+
+model_kwargs:
+  coarse_to_fine: true
+  coarse_factor: 2
+  coarse_loss_weight: 1.0
+  decoder_depth: 4
+  reg_tokens: 0
+  class_token: true
+  no_embed_class: false
+  mask_drop_scale: false
+  drop_path_rate: 0.0
+
+output_dir: /mnt/nvme/projects/training-pure-ViT-real-life-bench/checkpoints/experiments/vitl_coarse2fine_50k
+
+datasets:
+  fomo_train:
+    url: /mnt/nvme/projects/training-pure-ViT-real-life-bench/datasets/FOMO300/wds_with_dwi/shard.{000000..000333}.tar
+    samples_per_epoch: 50000
+    shuffle: true
+    buffer_size: 8000
+    drop_last: true
+  fomo_val:
+    url: /mnt/nvme/projects/training-pure-ViT-real-life-bench/datasets/FOMO300/wds_with_dwi/shard.{001621..001657}.tar
+    samples_per_epoch: 5500
+    shuffle: false
+    buffer_size: 1000
+    drop_last: false
+
+train_dataset: fomo_train
+eval_datasets: [fomo_val]
+
+epochs: 100
+warmup_epochs: 10
+batch_size: 64
+accum_iter: 1
+base_lr: 0.001
+min_lr: 1.0e-06
+weight_decay: 0.05
+betas: [0.9, 0.95]
+clip_grad: 1.0
+
+amp: true
+amp_dtype: bfloat16
+
+num_workers: 6
+prefetch_factor: 1
+presend_cuda: true
+
+checkpoint_period: 5
+max_checkpoints: 3
+eval_period: 5
+
+hf_repo_id: pau99/fomo26-checkpoints
+hf_subfolder: smri-fm-vitl-50k/coarse2fine
+
+wandb: true
+wandb_entity: palinaskipar-zdro-tech
+wandb_project: smri-fm-vitl-50k
+
+seed: 7338
+eval_seed: 7338
