@@ -1,0 +1,60 @@
+# Overrides merged on top of src/smri_mae/config/default_pretrain.yaml
+# (main_pretrain.py --cfg-path). Identical to ../vitl_baseline_4090/config.yaml
+# in every respect except model_kwargs.multiscale_layers -- fuses encoder
+# blocks 7/15/23 (of this ViT-L's 24) into the decoder input instead of just
+# the final block, via one new linear fusion layer. Single-variable
+# comparison against that baseline run.
+#
+# Same data cache, same batch/accum, same schedule, same everything else --
+# see the baseline config's comments for the reasoning (smoke-tested batch
+# size, why the data is a local subset, etc.), not repeated here.
+#
+# NOTE: unlike targetnorm/edgeloss, this trick does not change the loss
+# function at all -- eval/fomo_val/loss here is the exact same plain MSE as
+# vitl_baseline_4090's, so it's directly comparable with no adjustment.
+#
+# NOTE: this adds a new module (the fusion layer) with no counterpart in
+# the baseline checkpoint, so run a short smoke test first (a couple hundred
+# steps) to confirm no OOM at batch 12x5 before committing the full ~8h run
+# -- the extra module is small, but it also means 3 intermediate encoder
+# activations must be retained instead of 1, so peak memory may differ
+# slightly from the baseline's smoke-tested 18.9GB.
+
+name: vitl_multiscale_4090
+notes: >
+  Multi-scale decoder input (fuse encoder blocks 7/15/23 of 24, instead of
+  only the final block) applied on top of the same ViT-L / full-resolution
+  / FOMO300+DWI baseline recipe as vitl_baseline_4090. Single-variable
+  comparison: everything else is identical to that baseline run.
+
+model_kwargs:
+  multiscale_layers: [7, 15, 23]
+
+output_dir: checkpoints/experiments
+
+batch_size: 12
+accum_iter: 5
+
+datasets:
+  fomo_train:
+    # 9000 samples/epoch = one full, non-repeating pass over the local cache
+    # each epoch. 9000/60 = 150 steps/epoch x 100 epochs = 15000 steps total.
+    url: /workspace/data/fomo_dwi_subset/train/shard.{000000..000059}.tar
+    samples_per_epoch: 9000
+    shuffle: true
+    buffer_size: 8000
+    drop_last: true
+
+  fomo_val:
+    url: /workspace/data/fomo_dwi_subset/val/shard.{001621..001626}.tar
+    samples_per_epoch: 900
+    shuffle: false
+    buffer_size: 900
+    drop_last: false
+
+checkpoint_period: 20
+max_checkpoints: 1
+
+wandb: true
+wandb_entity: palinaskipar-zdro-tech
+wandb_project: smri-fm-vitl-baseline-4090
