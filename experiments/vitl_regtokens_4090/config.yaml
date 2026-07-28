@@ -1,0 +1,63 @@
+# Overrides merged on top of src/smri_mae/config/default_pretrain.yaml
+# (main_pretrain.py --cfg-path). Identical to ../vitl_baseline_4090/config.yaml
+# in every respect except model_kwargs.reg_tokens -- adds 4 register tokens
+# (Darcet et al., "Vision Transformers Need Registers") as dedicated
+# always-discarded scratch-space tokens, alongside the existing class token.
+# Hypothesis: gives the model somewhere to dump high-norm "artifact"
+# activations instead of polluting real patch tokens, which should leave
+# patch-level features cleaner for the FOMO26 segmentation tasks (Task 2
+# meningioma, Task 4 trigeminal neuralgia) that read patch tokens directly.
+# Single-variable comparison against vitl_baseline_4090.
+#
+# NOTE on comparability: forward_loss (src/smri_mae/model_mae.py) only ever
+# sees patch predictions vs patch targets -- register tokens are sliced off
+# via `patch = x[:, self.num_prefix_tokens:, :]` before anything reaches the
+# loss, same as the class token already is. So eval/fomo_val/loss here is
+# the exact same plain MSE as vitl_baseline_4090's, directly comparable with
+# no adjustment (same situation as vitl_multiscale_4090).
+#
+# Same data cache, same batch/accum, same schedule, same everything else --
+# see the baseline config's comments for the reasoning (smoke-tested batch
+# size, why the data is a local subset, etc.), not repeated here. No smoke
+# test needed: adding 4 more always-present tokens to a ~4000+-token
+# sequence is a negligible memory/compute delta, well within the baseline's
+# smoke-tested 18.9GB headroom.
+
+name: vitl_regtokens_4090
+notes: >
+  Register tokens (reg_tokens=4) applied on top of the same ViT-L /
+  full-resolution / FOMO300+DWI baseline recipe as vitl_baseline_4090.
+  Single-variable comparison: everything else is identical to that baseline
+  run.
+
+model_kwargs:
+  reg_tokens: 4
+
+output_dir: checkpoints/experiments
+
+batch_size: 12
+accum_iter: 5
+
+datasets:
+  fomo_train:
+    # 9000 samples/epoch = one full, non-repeating pass over the local cache
+    # each epoch. 9000/60 = 150 steps/epoch x 100 epochs = 15000 steps total.
+    url: /workspace/data/fomo_dwi_subset/train/shard.{000000..000059}.tar
+    samples_per_epoch: 9000
+    shuffle: true
+    buffer_size: 8000
+    drop_last: true
+
+  fomo_val:
+    url: /workspace/data/fomo_dwi_subset/val/shard.{001621..001626}.tar
+    samples_per_epoch: 900
+    shuffle: false
+    buffer_size: 900
+    drop_last: false
+
+checkpoint_period: 20
+max_checkpoints: 1
+
+wandb: true
+wandb_entity: palinaskipar-zdro-tech
+wandb_project: smri-fm-vitl-baseline-4090
