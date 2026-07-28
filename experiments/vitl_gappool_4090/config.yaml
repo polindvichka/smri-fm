@@ -1,0 +1,70 @@
+# Overrides merged on top of src/smri_mae/config/default_pretrain.yaml
+# (main_pretrain.py --cfg-path). Identical to ../vitl_baseline_4090/config.yaml
+# in every respect except model_kwargs.class_token -- drops the CLS token
+# entirely (both encoder and decoder read this same top-level flag, see
+# MaskedAutoencoderViT in src/smri_mae/model_mae.py), so downstream
+# consumers must mean-pool over patch tokens instead of reading a CLS
+# summary. Hypothesis: literature (MAE's own ablations, BEiT) finds
+# mean-pooled patch tokens transfer better to dense/segmentation tasks than
+# a CLS token, which tends to specialize toward global signal at the
+# expense of individual patch quality. FOMO26 has both segmentation (Task 2
+# meningioma, Task 4 trigeminal neuralgia) and classification/regression
+# tasks, so this could plausibly split -- itself a useful result. The
+# downstream eval side is already wired for this: asparagus_bridge's
+# SmriMaeBackbone already supports pool="cls" or mean-pooling
+# (src/asparagus_bridge/models_smri_mae.py), no new eval code needed.
+# Single-variable comparison against vitl_baseline_4090.
+#
+# NOTE on comparability: forward_loss (src/smri_mae/model_mae.py) only ever
+# sees patch predictions vs patch targets -- the CLS token is sliced off via
+# `patch = x[:, self.num_prefix_tokens:, :]` before anything reaches the
+# loss, same as register tokens are. So eval/fomo_val/loss here is the
+# exact same plain MSE as vitl_baseline_4090's, directly comparable with no
+# adjustment (same situation as vitl_multiscale_4090).
+#
+# Same data cache, same batch/accum, same schedule, same everything else --
+# see the baseline config's comments for the reasoning (smoke-tested batch
+# size, why the data is a local subset, etc.), not repeated here. No smoke
+# test needed: removing one token from a ~4000+-token sequence is a
+# negligible memory/compute delta, well within the baseline's smoke-tested
+# 18.9GB headroom.
+
+name: vitl_gappool_4090
+notes: >
+  CLS token dropped (class_token=false), applied on top of the same ViT-L /
+  full-resolution / FOMO300+DWI baseline recipe as vitl_baseline_4090.
+  Downstream tasks mean-pool over patch tokens instead of reading a CLS
+  summary. Single-variable comparison: everything else is identical to that
+  baseline run.
+
+model_kwargs:
+  class_token: false
+
+output_dir: checkpoints/experiments
+
+batch_size: 12
+accum_iter: 5
+
+datasets:
+  fomo_train:
+    # 9000 samples/epoch = one full, non-repeating pass over the local cache
+    # each epoch. 9000/60 = 150 steps/epoch x 100 epochs = 15000 steps total.
+    url: /workspace/data/fomo_dwi_subset/train/shard.{000000..000059}.tar
+    samples_per_epoch: 9000
+    shuffle: true
+    buffer_size: 8000
+    drop_last: true
+
+  fomo_val:
+    url: /workspace/data/fomo_dwi_subset/val/shard.{001621..001626}.tar
+    samples_per_epoch: 900
+    shuffle: false
+    buffer_size: 900
+    drop_last: false
+
+checkpoint_period: 20
+max_checkpoints: 1
+
+wandb: true
+wandb_entity: palinaskipar-zdro-tech
+wandb_project: smri-fm-vitl-baseline-4090
