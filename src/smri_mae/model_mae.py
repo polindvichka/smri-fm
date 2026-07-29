@@ -177,7 +177,7 @@ class MaskedEncoder(nn.Module):
         Tensor | None,
     ]:
         """
-        x: input data shape [B, C, D, H, W] 
+        x: input data shape [B, C, D, H, W]
         mask: visible mask, 1 = visible, 0 = invisible. broadcastable shape
         mask_ratio: mask ratio for uniform random masking
 
@@ -479,6 +479,8 @@ class MaskedAutoencoderViT(nn.Module, PyTorchModelHubMixin):
         no_decode_pos: bool = False,
         pos_embed: Literal["abs", "sep", "sincos"] = "sincos",
         target_norm: Literal["none", "global", "slice", "patch"] | None = None,
+        fft_loss_weight: float = 0.0,
+        fft_high_pass_cutoff: float = 0.3,
     ):
         super().__init__()
         img_size = _to_3d_tuple(img_size, "img_size")
@@ -557,10 +559,22 @@ class MaskedAutoencoderViT(nn.Module, PyTorchModelHubMixin):
         else:
             self.target_norm = None
 
+        # spectral (FFT) auxiliary loss: high-pass-filtered log-magnitude MSE
+        # between reconstructed and original full volumes, on top of the
+        # normal per-voxel pixel loss. Weight 0.0 (default) disables it
+        # entirely -- see forward_spectral_loss for details.
+        self.fft_loss_weight = fft_loss_weight
+        self.fft_high_pass_cutoff = fft_high_pass_cutoff
+        self.register_buffer(
+            "_fft_hp_mask",
+            _build_high_pass_mask(img_size, fft_high_pass_cutoff),
+            persistent=False,
+        )
+
         self.init_weights()
 
     def extra_repr(self):
-        return f"no_decode_pos={self.no_decode_pos}"
+        return f"no_decode_pos={self.no_decode_pos}, fft_loss_weight={self.fft_loss_weight}"
 
     def init_weights(self):
         self.apply(_init_weights)
@@ -674,12 +688,8 @@ class MaskedAutoencoderViT(nn.Module, PyTorchModelHubMixin):
         patch_errors = ((preds - targets) ** 2 * voxel_mask).sum(dim=1)
         patch_voxels = voxel_mask.sum(dim=1).to(dtype=patch_errors.dtype)
         batch_size = targets_patches.shape[0]
-        scan_errors = patch_errors.new_zeros(batch_size).scatter_add_(
-            0, batch_ids, patch_errors
-        )
-        scan_voxels = patch_voxels.new_zeros(batch_size).scatter_add_(
-            0, batch_ids, patch_voxels
-        )
+        scan_errors = patch_errors.new_zeros(batch_size).scatter_add_(0, batch_ids, patch_errors)
+        scan_voxels = patch_voxels.new_zeros(batch_size).scatter_add_(0, batch_ids, patch_voxels)
         return (scan_errors / scan_voxels).mean()
 
     @torch.no_grad()
@@ -708,6 +718,80 @@ class MaskedAutoencoderViT(nn.Module, PyTorchModelHubMixin):
         if img_mask is not None:
             pred_images = pred_images.masked_fill(~img_mask, 0)
         return pred_images
+
+    def reconstruct_images_for_loss(
+        self,
+        preds: Float[Tensor, "B Q P"],
+        pred_ids: Int[Tensor, "B Q"],
+        pred_token_mask: Tensor | None = None,
+        img_mask: Tensor | None = None,
+        targets_stats: tuple[Tensor, Tensor] | None = None,
+    ) -> Tensor:
+        """Same reconstruction as forward_pred_images, but WITHOUT @torch.no_grad
+        -- needed so the spectral auxiliary loss (forward_spectral_loss) can
+        backpropagate through the reconstructed volume during training.
+        forward_pred_images stays no_grad and untouched for the existing
+        eval/visualization path."""
+        B, _, P = preds.shape
+        N = self.pred_patchify.num_patches
+        if pred_token_mask is not None:
+            preds = preds.masked_fill(~pred_token_mask.unsqueeze(-1), 0)
+
+        preds = torch.zeros((B, N, P), dtype=preds.dtype, device=preds.device).scatter_add_(
+            1, pred_ids.unsqueeze(-1).expand(-1, -1, P), preds
+        )
+
+        if targets_stats is not None:
+            targets_mean, targets_std = targets_stats
+            preds = preds * targets_std + targets_mean
+
+        pred_images = self.pred_patchify.unpatchify(preds)
+        if img_mask is not None:
+            pred_images = pred_images.masked_fill(~img_mask, 0)
+        return pred_images
+
+    def forward_spectral_loss(
+        self,
+        pred_images: Tensor,
+        images: Tensor,
+        img_mask: Tensor | None,
+    ) -> Tensor:
+        """High-pass-filtered 3D FFT log-magnitude MSE between the reconstructed
+        and original full volumes -- an auxiliary loss on top of the normal
+        per-voxel pixel loss, targeting high-frequency spatial structure
+        (tissue/lesion boundaries) that per-voxel MSE alone under-weights.
+
+        Based on "Masked and Predictive Self-Supervised Foundation Models for
+        3D Brain MRI" (arXiv:2606.13315), where this gave the largest gains on
+        sharp-boundary segmentation tasks (tumor grading) vs diffuse-pathology
+        tasks, tracking how much high-frequency spatial energy each task's
+        structures contain. FOMO26's two segmentation tasks (meningioma,
+        trigeminal neuralgia) are both sharp/bounded-lesion style, matching
+        the profile that paper found this helps most.
+
+        Computed in float32 regardless of the ambient autocast dtype -- FFT
+        is numerically unstable in bf16/fp16.
+
+        pred_images, images: [B, C, D, H, W]
+        """
+        pred = pred_images.float()
+        target = images.float()
+        if img_mask is not None:
+            mask = img_mask.to(dtype=torch.bool)
+            pred = pred.masked_fill(~mask, 0)
+            target = target.masked_fill(~mask, 0)
+
+        pred_fft = torch.fft.fftn(pred, dim=(-3, -2, -1))
+        target_fft = torch.fft.fftn(target, dim=(-3, -2, -1))
+
+        pred_mag = torch.log1p(pred_fft.abs())
+        target_mag = torch.log1p(target_fft.abs())
+
+        hp_mask = self._fft_hp_mask
+        diff2 = ((pred_mag - target_mag) * hp_mask) ** 2
+        denom = hp_mask.sum().clamp(min=1.0)
+        # sum over spatial dims / nnz high-freq bins, then average over batch+channel
+        return (diff2.sum(dim=(-3, -2, -1)) / denom).mean()
 
     def forward(
         self,
@@ -747,16 +831,21 @@ class MaskedAutoencoderViT(nn.Module, PyTorchModelHubMixin):
             pad_to_multiple=pad_to_multiple,
         )
 
+        # need the unpacked (B, Q, P) decoder layout -- not just the packed
+        # pred_token_mask-indexed rows -- whenever we're either returning the
+        # full state dict (with_state) or need to reconstruct full volumes
+        # for the spectral loss (fft_loss_weight > 0).
+        need_full_preds = with_state or bool(self.fft_loss_weight)
         preds = self.forward_decoder(
             patch_embeds,
             visible_ids,
             pred_ids,
             visible_token_mask=visible_token_mask,
             pred_token_mask=pred_token_mask,
-            packed_output=not with_state,
+            packed_output=not need_full_preds,
         )
 
-        loss_preds = preds if not with_state else preds[pred_token_mask]
+        loss_preds = preds[pred_token_mask] if need_full_preds else preds
         loss = self.forward_loss(
             loss_preds,
             targets_patches,
@@ -764,18 +853,30 @@ class MaskedAutoencoderViT(nn.Module, PyTorchModelHubMixin):
             pred_ids,
             pred_token_mask,
         )
+        # plain per-voxel MSE, cached before the spectral term is added on
+        # top -- this is what's directly comparable to a no-fft-loss baseline
+        # run's eval/fomo_val/loss (same situation as target_norm's raw_mse).
+        self.last_plain_mse = loss.detach()
+
+        pred_images = None
+        if need_full_preds:
+            pred_images = self.reconstruct_images_for_loss(
+                preds,
+                pred_ids,
+                pred_token_mask=pred_token_mask,
+                img_mask=img_mask,
+                targets_stats=targets_stats,
+            )
+
+        if self.fft_loss_weight:
+            spectral = self.forward_spectral_loss(pred_images, images, img_mask)
+            self.last_spectral_loss = spectral.detach()
+            loss = loss + self.fft_loss_weight * spectral
 
         if not with_state:
             return loss
 
         pred_mask = self.pred_patchify.unpatchify(pred_mask_patches)
-        pred_images = self.forward_pred_images(
-            preds,
-            pred_ids,
-            pred_token_mask=pred_token_mask,
-            img_mask=img_mask,
-            targets_stats=targets_stats,
-        )
 
         state = {
             "targets_patches": targets_patches,
@@ -864,6 +965,32 @@ def _to_3d_tuple(value: int | Sequence[int], name: str) -> tuple[int, int, int]:
     if len(value) != 3:
         raise ValueError(f"{name} must have exactly 3 spatial dimensions, got {tuple(value)}")
     return tuple(int(item) for item in value)
+
+
+def _build_high_pass_mask(img_size: tuple[int, int, int], cutoff: float) -> Tensor:
+    """3D frequency-domain mask, 1.0 outside a radius `cutoff` (in cycles/voxel,
+    same convention as torch.fft.fftfreq, max single-axis Nyquist = 0.5) of the
+    DC component and 0.0 inside -- used to select the high-frequency band of a
+    volume's FFT for the spectral auxiliary loss. Not fftshift'd: index 0 along
+    every axis is DC, matching the un-shifted layout torch.fft.fftn returns.
+
+    NOTE: because frequency-bin *count* grows with radius^3 in 3D, a spherical
+    radius cutoff keeps a large fraction of bins by count even at a fairly
+    aggressive cutoff (e.g. ~89% of bins survive cutoff=0.3) -- that's expected
+    and fine here, since real image energy is heavily concentrated near DC
+    (roughly 1/f^2), so excluding just the innermost low-radius core still
+    meaningfully suppresses the dominant low-frequency energy that per-voxel
+    MSE already captures well. cutoff=0.3 is a reasonable untuned starting
+    point, not derived from the source paper (arXiv:2606.13315), whose exact
+    cutoff value wasn't available -- worth sweeping if this trick looks
+    promising."""
+    d, h, w = img_size
+    fd = torch.fft.fftfreq(d)
+    fh = torch.fft.fftfreq(h)
+    fw = torch.fft.fftfreq(w)
+    gd, gh, gw = torch.meshgrid(fd, fh, fw, indexing="ij")
+    radius = torch.sqrt(gd**2 + gh**2 + gw**2)
+    return (radius > cutoff).float()
 
 
 # JAX ViT xavier uniform init

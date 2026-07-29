@@ -1,0 +1,82 @@
+# Overrides merged on top of src/smri_mae/config/default_pretrain.yaml
+# (main_pretrain.py --cfg-path). Identical to ../vitl_baseline_4090/config.yaml
+# in every respect except model_kwargs.fft_loss_weight -- adds a spectral
+# (3D FFT) auxiliary loss on top of the normal per-voxel MSE, computed
+# between the full reconstructed volume and the original volume, high-pass
+# filtered to emphasize the fine spatial detail (tissue/lesion boundaries)
+# that per-voxel MSE alone under-weights.
+#
+# Based on "Masked and Predictive Self-Supervised Foundation Models for 3D
+# Brain MRI" (arXiv:2606.13315), where this gave the largest downstream
+# gains on sharp-boundary classification tasks (tumor grading, +6.3 AUC
+# points) vs diffuse-pathology tasks -- and FOMO26's two segmentation tasks
+# (meningioma, trigeminal neuralgia) are both sharp/bounded-lesion style, so
+# this specific pretraining bias is plausibly a good match. This is a
+# stronger-evidenced version of the same "boundary/edge quality matters"
+# hypothesis vitl_edgeloss_4090 tested (which underperformed) -- this trick
+# reweights in the FREQUENCY domain across the whole reconstructed volume,
+# not per-voxel gradient magnitude, and the auxiliary term is additive on
+# top of the normal loss rather than replacing/reweighting it.
+#
+# fft_loss_weight=0.1, fft_high_pass_cutoff=0.3 are both untuned first
+# guesses -- see forward_spectral_loss and _build_high_pass_mask docstrings
+# in src/smri_mae/model_mae.py for the reasoning (spherical radius cutoff in
+# 3D keeps more bins by count than the number alone suggests, since real
+# image energy concentrates near DC). Worth sweeping if this looks
+# promising.
+#
+# NOTE on comparability: the model now caches self.last_plain_mse -- the
+# per-voxel MSE BEFORE the spectral term is added -- logged as train/
+# plain_mse and eval/fomo_val/plain_mse. Compare THAT to baseline's
+# eval/fomo_val/loss, not the plain eval/fomo_val/loss field here (which
+# now includes the added spectral term and is inflated/not directly
+# comparable, same situation as coarse2fine's fine_loss vs its total loss).
+#
+# Compute overhead: benchmarked at batch 12 on this architecture, the
+# spectral term adds ~4% step time and ~3GB peak memory relative to
+# fft_loss_weight=0 on the same code -- well within the baseline's
+# smoke-tested headroom. No separate smoke test required, but keep an eye
+# on peak memory on first launch since this touches a new code path.
+#
+# Same data cache, same batch/accum, same schedule, same everything else --
+# see the baseline config's comments for the reasoning, not repeated here.
+
+name: vitl_fftloss_4090
+notes: >
+  Spectral (3D FFT) auxiliary loss, high-pass filtered, added on top of the
+  normal per-voxel MSE -- applied on top of the same ViT-L / full-resolution
+  / FOMO300+DWI baseline recipe as vitl_baseline_4090. Single-variable
+  comparison: everything else is identical to that baseline run.
+
+model_kwargs:
+  fft_loss_weight: 0.1
+  fft_high_pass_cutoff: 0.3
+
+output_dir: checkpoints/experiments
+
+batch_size: 12
+accum_iter: 5
+
+datasets:
+  fomo_train:
+    # 9000 samples/epoch = one full, non-repeating pass over the local cache
+    # each epoch. 9000/60 = 150 steps/epoch x 100 epochs = 15000 steps total.
+    url: /workspace/data/fomo_dwi_subset/train/shard.{000000..000059}.tar
+    samples_per_epoch: 9000
+    shuffle: true
+    buffer_size: 8000
+    drop_last: true
+
+  fomo_val:
+    url: /workspace/data/fomo_dwi_subset/val/shard.{001621..001626}.tar
+    samples_per_epoch: 900
+    shuffle: false
+    buffer_size: 900
+    drop_last: false
+
+checkpoint_period: 20
+max_checkpoints: 1
+
+wandb: true
+wandb_entity: palinaskipar-zdro-tech
+wandb_project: smri-fm-vitl-baseline-4090

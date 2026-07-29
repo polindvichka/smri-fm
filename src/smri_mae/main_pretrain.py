@@ -444,11 +444,20 @@ def train_one_epoch(
         if need_update and log_step:
             loss_value = loss_for_log.item()
             grad_norm_value = grad_norm.item()
-            metric_logger.update(loss=loss_value, lr=lr, grad=grad_norm_value)
+            # last_plain_mse is set on every forward() call regardless of
+            # fft_loss_weight -- the plain per-voxel MSE before the spectral
+            # term is added on top, directly comparable to a baseline run's
+            # train/loss (same situation as target_norm's last_raw_mse).
+            plain_mse_module = model.module if args.distributed else model
+            plain_mse_value = plain_mse_module.last_plain_mse.item()
+            metric_logger.update(
+                loss=loss_value, plain_mse=plain_mse_value, lr=lr, grad=grad_norm_value
+            )
             if log_wandb:
                 wandb.log(
                     {
                         "train/loss": loss_value,
+                        "train/plain_mse": plain_mse_value,
                         "train/lr": lr,
                         "train/grad": grad_norm_value,
                     },
@@ -529,6 +538,12 @@ def evaluate(
         if not finite.item():
             raise RuntimeError("non-finite validation loss detected")
         metric_logger.meters["loss"].update(loss_value, n=int(batch["img_mask"].shape[0]))
+        # see train_one_epoch's plain_mse comment: same quantity the plain
+        # baseline optimizes as its whole loss, fair comparison metric.
+        plain_mse_module = model.module if args.distributed else model
+        metric_logger.meters["plain_mse"].update(
+            plain_mse_module.last_plain_mse.item(), n=int(batch["img_mask"].shape[0])
+        )
 
         if is_master and batch_step == example_step:
             example_batch = {"image": images[:1], "img_mask": img_mask[:1]}
