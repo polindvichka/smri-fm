@@ -43,6 +43,15 @@ dependencies = [
 [tool.uv.sources]
 asparagus = { path = "third_party/asparagus", editable = true }
 asparagus_preprocessing = { path = "third_party/asparagus_preprocessing", editable = true }
+# This host has no NVIDIA GPU (Tenstorrent Blackhole only) -- the CUDA torch
+# wheel is unusable dead weight (~4GB of nvidia-* libs). Pin to the CPU wheel.
+torch = { index = "pytorch-cpu" }
+torchvision = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [tool.uv]
 override-dependencies = [
@@ -64,4 +73,4 @@ line-length = 100
 ignore = ["F722"]
 
 [tool.pytest.ini_options]
-norecursedirs = ["third_party", ".scratch"]
+norecursedirs = ["third_party", ".scratch", "tenstorrent"]

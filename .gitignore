@@ -25,6 +25,7 @@ uv.lock
 
 # Local data directories
 /data/
+/datasets/FOMO_with_dwi/
 *.pth
 *.mds
 
@@ -49,3 +50,10 @@ CLAUDE.md
 # Slurm outputs
 *.out
 *.err
+
+# Tenstorrent tt-metal upstream checkout + build artifacts (fetched by tenstorrent/scripts/setup.sh)
+/tenstorrent/tt-metal/
+
+# tt-metal runtime debug/watcher output, dropped at cwd when device tests run
+# (wherever cwd was when a device test ran -- repo root or any subdirectory).
+generated/

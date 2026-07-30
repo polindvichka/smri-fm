@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "smri-mae-tt"
+version = "0.1.0"
+description = "Tenstorrent TT-NN/tt-train port of smri_mae (3D ViT-L MAE)"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "numpy",
+    "pytest",
+    "smri-fm",
+]
+
+# ttnn/ttml are not PyPI packages -- they're produced by
+# tenstorrent/scripts/setup.sh building tt-metal from source and are wired
+# into tenstorrent/tt-metal/python_env via .pth files, not through uv's
+# dependency graph. This project is installed into that same venv
+# (`uv pip install --python .../python_env/bin/python -e tenstorrent`) so
+# ttnn/ttml, numpy, and smri_mae_tt all end up importable together.
+[tool.uv.sources]
+smri-fm = { path = "..", editable = true }
+# This host has no NVIDIA GPU (Tenstorrent Blackhole only) -- the CUDA torch
+# wheel is unusable dead weight (~4GB of nvidia-* libs). Pin to the CPU wheel.
+torch = { index = "pytorch-cpu" }
+torchvision = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+# smri-fm pulls in asparagus (third_party/asparagus), which pins an older
+# torch transitively -- mirror root pyproject.toml's override so resolution
+# doesn't conflict with smri-fm's own torch==2.8.0 requirement.
+[tool.uv]
+override-dependencies = [
+    "torch==2.8.0",
+    "torchvision==0.23.0",
+    "huggingface-hub<1.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+norecursedirs = ["tt-metal"]
+
+[tool.ruff]
+line-length = 100
