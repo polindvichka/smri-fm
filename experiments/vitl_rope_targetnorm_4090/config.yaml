@@ -1,0 +1,83 @@
+# Overrides merged on top of src/smri_mae/config/default_pretrain.yaml
+# (main_pretrain.py --cfg-path). Combines the two single-variable tricks
+# that actually held up at 50k scale (see vitl_rope_4090/50k and
+# vitl_targetnorm_4090/50k): use_rope + target_norm=patch, both on at once.
+# Everything else is identical to vitl_baseline_4090, same as those two
+# individual runs, so the comparison stays fair against that same baseline.
+#
+# Why these two specifically: at 9k, rope was -33.0% and target_norm was
+# -3.4% vs baseline; at 50k, rope held at -9.8% and target_norm actually
+# strengthened to -16.2%. coarse2fine/multiscale both collapsed to noise at
+# 50k and aren't included here. Open question this run is meant to answer:
+# do the two effects stack (roughly additive), or overlap (redundant gains,
+# combined result closer to whichever one is stronger alone), or interact
+# badly (combined worse than either alone)? No prior data on this from
+# either individual branch, since they were only ever tested in isolation.
+#
+# batch_size/accum_iter: kept at vitl_baseline_4090's 12x5 (not rope_4090's
+# later 30x2, which was re-tuned for a different, 96GB local card). RoPE
+# alone measured ~13% step time / ~6GB peak memory overhead over baseline's
+# 18.9GB at 12x5 (see vitl_rope_4090/config.yaml) -- target_norm adds no
+# memory overhead of its own (pure loss-side change), so this combined run
+# should land close to rope's own footprint, ~25GB. That's over a 24GB
+# card's budget, so if this runs on the same rented-4090 baseline used,
+# either drop to a smaller micro-batch (e.g. 8x8 / global 64) or confirm
+# available VRAM before launching. Worth an eye on peak memory on first
+# launch either way, same caution as vitl_rope_4090's own config notes.
+#
+# NOTE on comparability: target_norm changes the scale of the plain
+# eval/fomo_val/loss (normalized-target scale, not directly comparable to
+# baseline). Compare via eval/fomo_val/raw_mse instead (de-normalized back
+# to original intensity scale, logged automatically whenever target_norm is
+# set -- see model_mae.py forward_loss) against vitl_baseline_4090's plain
+# eval/fomo_val/loss. RoPE itself doesn't change the loss's scale, so
+# raw_mse is the correct, single fair number to use for this combined run
+# too, same as it is for vitl_targetnorm_4090 alone.
+#
+# Same data cache, same batch/accum baseline, same schedule as
+# vitl_baseline_4090 otherwise -- see that config's comments for the
+# reasoning, not repeated here.
+
+name: vitl_rope_targetnorm_4090
+notes: >
+  Combines RoPE (use_rope=true) and per-patch target normalization
+  (target_norm=patch), the two tricks that held up at 50k scale, applied
+  together on top of the same ViT-L / full-resolution / FOMO300+DWI
+  baseline recipe as vitl_baseline_4090. Tests whether the two effects
+  stack, overlap, or interact badly -- no prior data on this, since both
+  were only tested in isolation before.
+
+model_kwargs:
+  use_rope: true
+  target_norm: patch
+
+output_dir: checkpoints/experiments
+
+batch_size: 12
+accum_iter: 5
+
+datasets:
+  fomo_train:
+    # Same 9k/60-shard local cache and shard range as vitl_baseline_4090,
+    # vitl_targetnorm_4090, and vitl_rope_4090's original (pre-96GB-card)
+    # config -- 9000 samples/epoch, 150 steps/epoch x 100 epochs = 15000
+    # steps total.
+    url: /workspace/data/fomo_dwi_subset/train/shard.{000000..000059}.tar
+    samples_per_epoch: 9000
+    shuffle: true
+    buffer_size: 8000
+    drop_last: true
+
+  fomo_val:
+    url: /workspace/data/fomo_dwi_subset/val/shard.{001621..001626}.tar
+    samples_per_epoch: 900
+    shuffle: false
+    buffer_size: 900
+    drop_last: false
+
+checkpoint_period: 20
+max_checkpoints: 1
+
+wandb: true
+wandb_entity: palinaskipar-zdro-tech
+wandb_project: smri-fm-vitl-baseline-4090
