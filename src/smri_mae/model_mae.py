@@ -38,6 +38,19 @@ from .modules import (
 from .masking import pad_patch_mask
 
 
+def _grid_positions(ids: Tensor, grid_size: tuple[int, int, int]) -> Tensor:
+    """Flat patch-grid indices [..., L] -> 3D grid coordinates [..., L, 3],
+    matching the row-major (D, H, W) flattening Patchify3D and the position
+    embedding grids (e.g. SinCosPosEmbed3D's `x.reshape((B, *grid_size, D))`)
+    use -- needed to give RoPE each packed token's real spatial position."""
+    Dg, Hg, Wg = grid_size
+    d = torch.div(ids, Hg * Wg, rounding_mode="floor")
+    rem = ids % (Hg * Wg)
+    h = torch.div(rem, Wg, rounding_mode="floor")
+    w = rem % Wg
+    return torch.stack([d, h, w], dim=-1).float()
+
+
 class MaskedEncoder(nn.Module):
     """
     Masked transformer encoder.
@@ -60,12 +73,15 @@ class MaskedEncoder(nn.Module):
         final_norm: bool = True,
         drop_path_rate: float = 0.0,
         mask_drop_scale: bool = False,
+        use_rope: bool = False,
+        rope_theta: float = 10000.0,
     ):
         super().__init__()
         self.num_prefix_tokens = int(class_token) + reg_tokens
         self.num_reg_tokens = reg_tokens
         self.has_class_token = class_token
         self.no_embed_class = no_embed_class
+        self.use_rope = use_rope
 
         # scale inputs by 1 / observed rate (like dropout)
         self.mask_drop_scale = mask_drop_scale
@@ -99,6 +115,8 @@ class MaskedEncoder(nn.Module):
                     proj_bias=proj_bias,
                     mlp_ratio=mlp_ratio,
                     drop_path=dpr[ii],
+                    use_rope=use_rope,
+                    rope_theta=rope_theta,
                 )
                 for ii in range(depth)
             ]
@@ -111,7 +129,8 @@ class MaskedEncoder(nn.Module):
     def extra_repr(self):
         return (
             f"class_token={self.has_class_token}, reg_tokens={self.num_reg_tokens}, "
-            f"no_embed_class={self.no_embed_class}, mask_drop_scale={self.mask_drop_scale}"
+            f"no_embed_class={self.no_embed_class}, mask_drop_scale={self.mask_drop_scale}, "
+            f"use_rope={self.use_rope}"
         )
 
     def reset_parameters(self) -> None:
@@ -214,7 +233,8 @@ class MaskedEncoder(nn.Module):
 
         # patch and position embed
         x = self.patch_embed(x)
-        x = self.pos_embed(x)
+        if not self.use_rope:
+            x = self.pos_embed(x)
 
         if mask is not None or mask_ratio is not None:
             mask_ratio = 0.0 if mask_ratio is None else mask_ratio
@@ -232,9 +252,17 @@ class MaskedEncoder(nn.Module):
             mask_ids = None
             token_mask = None
 
+        positions = None
+        if self.use_rope:
+            ids = mask_ids
+            if ids is None:
+                ids = torch.arange(N, device=x.device).unsqueeze(0).expand(B, -1)
+            positions = _grid_positions(ids, self.patchify.grid_size)
+
         cls_embeds, reg_embeds, patch_embeds = self.forward_patch_embeds(
             x,
             token_mask=token_mask,
+            positions=positions,
         )
         return cls_embeds, reg_embeds, patch_embeds, mask, mask_ids, token_mask
 
@@ -242,6 +270,7 @@ class MaskedEncoder(nn.Module):
         self,
         x: Float[Tensor, "B L D"],
         token_mask: Tensor | None = None,
+        positions: Float[Tensor, "B L 3"] | None = None,
     ) -> tuple[
         Float[Tensor, "B 1 D"] | None,
         Float[Tensor, "B R D"] | None,
@@ -252,10 +281,19 @@ class MaskedEncoder(nn.Module):
             token_mask = torch.ones(x.shape[:2], dtype=torch.bool, device=x.device)
         x = self.cat_tokens(x)
         token_mask = self.cat_token_mask(token_mask, B)
+
+        flat_positions = None
+        if positions is not None:
+            # cls/reg prefix tokens get position (0,0,0) -- zero rotation
+            # angle, i.e. left un-rotated -- matching cat_tokens' prepend order.
+            prefix_positions = positions.new_zeros(B, self.num_prefix_tokens, 3)
+            positions = torch.cat([prefix_positions, positions], dim=1)
+            flat_positions = positions[token_mask]
+
         jagged_batch = JaggedBatch.from_mask(token_mask)
         x = x[token_mask]
         for block in self.blocks:
-            x = block(x, jagged_batch=jagged_batch)
+            x = block(x, jagged_batch=jagged_batch, positions=flat_positions)
         x = self.norm(x)
         x = unpack_tokens(x, token_mask)
 
@@ -282,10 +320,12 @@ class MaskedEncoder(nn.Module):
             patch_num_obs = mask_patches.sum(dim=-1).to(x.dtype)
             x = x * (self.patchify.patch_dim / patch_num_obs.unsqueeze(-1).clamp(min=1.0))
         x = self.patch_embed(x)
-        x = self.pos_embed(x)
+        if not self.use_rope:
+            x = self.pos_embed(x)
         visible_ids = visible_ids.to(device=x.device)
         x = x.gather(1, visible_ids.unsqueeze(-1).expand(-1, -1, x.shape[-1]))
-        return self.forward_patch_embeds(x)
+        positions = _grid_positions(visible_ids, self.patchify.grid_size) if self.use_rope else None
+        return self.forward_patch_embeds(x, positions=positions)
 
     def forward_embedding(
         self,
@@ -318,11 +358,14 @@ class MaskedDecoder(nn.Module):
         class_token: bool = True,
         no_embed_class: bool = False,
         final_norm: bool = True,
+        use_rope: bool = False,
+        rope_theta: float = 10000.0,
     ):
         super().__init__()
         input_dim = embed_dim if input_dim is None else input_dim
         self.has_class_token = class_token
         self.no_embed_class = no_embed_class
+        self.use_rope = use_rope
 
         self.cls_token = nn.Parameter(torch.empty(1, 1, embed_dim)) if class_token else None
         self.cls_token_pos = (
@@ -345,6 +388,8 @@ class MaskedDecoder(nn.Module):
                     qkv_bias=qkv_bias,
                     proj_bias=proj_bias,
                     mlp_ratio=mlp_ratio,
+                    use_rope=use_rope,
+                    rope_theta=rope_theta,
                 )
                 for _ in range(depth)
             ]
@@ -358,7 +403,10 @@ class MaskedDecoder(nn.Module):
         self.reset_parameters()
 
     def extra_repr(self):
-        return f"class_token={self.has_class_token}, no_embed_class={self.no_embed_class}"
+        return (
+            f"class_token={self.has_class_token}, no_embed_class={self.no_embed_class}, "
+            f"use_rope={self.use_rope}"
+        )
 
     def reset_parameters(self) -> None:
         # official mae initializes decoder cls token to zeros
@@ -416,11 +464,12 @@ class MaskedDecoder(nn.Module):
 
         Q = self.pos_embed.num_patches if pred_ids is None else pred_ids.shape[1]
         mask = self.mask_token.expand(B, Q, -1)
-        mask = self.pos_embed(mask, pos_ids=pred_ids)
+        if not self.use_rope:
+            mask = self.pos_embed(mask, pos_ids=pred_ids)
 
         embeds = self.proj(embeds)
 
-        if embed_ids is not None:
+        if embed_ids is not None and not self.use_rope:
             embeds = self.pos_embed(embeds, pos_ids=embed_ids)
         if embed_token_mask is None:
             embed_token_mask = torch.ones((B, L), dtype=torch.bool, device=embeds.device)
@@ -429,17 +478,43 @@ class MaskedDecoder(nn.Module):
         x = torch.cat([embeds, mask], dim=1)
         token_mask = torch.cat([embed_token_mask, pred_token_mask], dim=1)
 
+        positions = None
+        if self.use_rope:
+            grid_size = self.pos_embed.grid_size
+            embed_pos_ids = embed_ids
+            if embed_pos_ids is None:
+                embed_pos_ids = torch.arange(L, device=embeds.device).unsqueeze(0).expand(B, -1)
+            pred_pos_ids = pred_ids
+            if pred_pos_ids is None:
+                pred_pos_ids = torch.arange(Q, device=embeds.device).unsqueeze(0).expand(B, -1)
+            positions = torch.cat(
+                [
+                    _grid_positions(embed_pos_ids, grid_size),
+                    _grid_positions(pred_pos_ids, grid_size),
+                ],
+                dim=1,
+            )
+
         x = self.cat_tokens(x)
         token_mask = self.cat_token_mask(token_mask, B)
+
+        flat_positions = None
+        if positions is not None:
+            # cls prefix token (if any) gets position (0,0,0) -- zero rotation
+            # angle, matching cat_tokens' prepend order.
+            if self.has_class_token:
+                positions = torch.cat([positions.new_zeros(B, 1, 3), positions], dim=1)
+            flat_positions = positions[token_mask]
+
         jagged_batch = JaggedBatch.from_mask(token_mask)
         x = x[token_mask]
         # Keep headroom for rare maximum-length PSP batches.
         checkpoint_start = max(0, len(self.blocks) - 2)
         for block_index, block in enumerate(self.blocks):
             if self.training and torch.is_grad_enabled() and block_index >= checkpoint_start:
-                x = checkpoint(block, x, jagged_batch, use_reentrant=False)
+                x = checkpoint(block, x, jagged_batch, flat_positions, use_reentrant=False)
             else:
-                x = block(x, jagged_batch=jagged_batch)
+                x = block(x, jagged_batch=jagged_batch, positions=flat_positions)
 
         x = self.norm(x)
         if packed_output:
@@ -479,6 +554,8 @@ class MaskedAutoencoderViT(nn.Module, PyTorchModelHubMixin):
         no_decode_pos: bool = False,
         pos_embed: Literal["abs", "sep", "sincos"] = "sincos",
         target_norm: Literal["none", "global", "slice", "patch"] | None = None,
+        use_rope: bool = False,
+        rope_theta: float = 10000.0,
     ):
         super().__init__()
         img_size = _to_3d_tuple(img_size, "img_size")
@@ -518,6 +595,8 @@ class MaskedAutoencoderViT(nn.Module, PyTorchModelHubMixin):
             no_embed_class=no_embed_class,
             drop_path_rate=drop_path_rate,
             mask_drop_scale=mask_drop_scale,
+            use_rope=use_rope,
+            rope_theta=rope_theta,
         )
 
         self.pred_patchify = patchify
@@ -543,6 +622,8 @@ class MaskedAutoencoderViT(nn.Module, PyTorchModelHubMixin):
             mlp_ratio=mlp_ratio,
             class_token=class_token,
             no_embed_class=no_embed_class,
+            use_rope=use_rope,
+            rope_theta=rope_theta,
         )
 
         # mae style target normalization

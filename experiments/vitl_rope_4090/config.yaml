@@ -1,0 +1,110 @@
+# Overrides merged on top of src/smri_mae/config/default_pretrain.yaml
+# (main_pretrain.py --cfg-path). Identical to ../vitl_baseline_4090/config.yaml
+# in every respect except model_kwargs.use_rope -- replaces the additive
+# sin-cos position embedding with 3D-axial rotary position embedding (RoPE),
+# applied inside every attention layer (both encoder and decoder) instead of
+# added to the token once up front.
+#
+# Hypothesis: relative-position reasoning (RoPE encodes distance BETWEEN two
+# patches, not their absolute grid coordinates) generalizes better for local
+# structural patterns -- useful for FOMO26's segmentation tasks (meningioma,
+# trigeminal neuralgia), which care about structure wherever it appears.
+# Honest counter-consideration: this data is registered to a common MNI152
+# template, so absolute position is actually meaningfully informative here
+# (position X is roughly the same brain region across subjects) in a way
+# it isn't for generic natural images -- weakens RoPE's usual advantage for
+# this specific domain. Real hypothesis, not a guaranteed win. See RoMedFormer
+# (3D RoPE for genito-pelvic MRI/CT segmentation) for prior art applying
+# rotary embeddings to 3D medical imaging specifically.
+#
+# Implementation: 3D-axial RoPE, splits each attention head's dim into 3
+# per-axis chunks (one per spatial dimension: D, H, W), rotates each chunk
+# by an angle proportional to that token's grid coordinate along the
+# matching axis; any head_dim remainder beyond 3*chunk_dim is left
+# unrotated. CLS/register tokens get position (0,0,0) -- zero rotation
+# angle, i.e. left un-rotated, since they have no natural spatial position.
+# See apply_rope_3d / _grid_positions in src/smri_mae/modules.py and
+# model_mae.py. Verified: identity at position (0,0,0), rotation changes
+# output for nonzero positions, and the dot product of a rotated q/k pair
+# depends only on their relative distance (not absolute position) --
+# confirmed numerically before committing this branch.
+#
+# use_rope=True internally skips the additive pos_embed call entirely
+# (encoder and decoder both) rather than stacking RoPE on top of it --
+# standard practice, avoids redundant/conflicting position signals. No
+# separate pos_embed override needed here; it stays at the default "sincos"
+# but is simply never called when use_rope=True.
+#
+# NOTE on comparability: RoPE only changes how attention scores are
+# computed internally (rotating Q/K before the dot product) -- it never
+# touches patchify, masking, or the loss function, so eval/fomo_val/loss
+# here is the exact same plain MSE as vitl_baseline_4090's, directly
+# comparable with no adjustment (same situation as vitl_multiscale_4090).
+#
+# Compute overhead: benchmarked at batch 12 on this architecture, RoPE adds
+# ~13% step time and ~6GB peak memory relative to use_rope=False on the
+# same code -- more than the other 4090 tricks so far, but still within
+# headroom. No separate smoke test strictly required given the forward/
+# backward correctness checks already done, but worth a quick eye on peak
+# memory on first launch since this is the most invasive code change of
+# the group (touches attention itself, not just the loss or a config flag).
+#
+# batch_size/accum_iter: vitl_baseline_4090's 12x5 was sized for a rented
+# RTX 4090's 24GB (used 18.9GB there, deliberately not maxed). Running on a
+# local 96GB RTX 6000 with that same 12x5 leaves most of the card idle --
+# confirmed via nvidia-smi during an actual launch, ~19-25GB used out of
+# 96GB. Smoke-tested with real data on this hardware: 12x5 -> 40 samples/s,
+# 19.2GB peak; 30x2 -> 60 samples/s (~50% faster), 38.8GB peak; 60x1 -> 62
+# samples/s (no further real gain over 30x2, just more memory, 68.8GB peak
+# -- the GPU is already compute-saturated by 30x2). Set to 30x2: captures
+# essentially all the available speedup with a comfortable memory margin
+# (~40% of 96GB). Global batch (batch_size x accum_iter = 60) is unchanged
+# from vitl_baseline_4090, so this is a pure speed change -- same effective
+# batch size, same LR, same training recipe/dynamics, not a different
+# experiment.
+#
+# Same data cache, same schedule, same everything else -- see the baseline
+# config's comments for the reasoning, not repeated here.
+
+name: vitl_rope_4090
+notes: >
+  3D-axial rotary position embedding (RoPE), replacing the additive sin-cos
+  position embedding, applied on top of the same ViT-L / full-resolution /
+  FOMO300+DWI baseline recipe as vitl_baseline_4090. Single-variable
+  comparison: everything else is identical to that baseline run.
+
+model_kwargs:
+  use_rope: true
+
+output_dir: /mnt/nvme/projects/training-pure-ViT-real-life-bench/checkpoints/experiments
+
+batch_size: 30
+accum_iter: 2
+
+datasets:
+  fomo_train:
+    # 9000 samples/epoch = one full, non-repeating pass over the local cache
+    # each epoch. 9000/60 = 150 steps/epoch x 100 epochs = 15000 steps total.
+    # Same shard range as vitl_baseline_4090 (000000-000059), just pointed at
+    # this machine's local copy of the full dataset instead of the rented
+    # 4090 box's /workspace/data staging path -- same 9k samples either way.
+    url: /mnt/nvme/projects/training-pure-ViT-real-life-bench/datasets/FOMO300/wds_with_dwi/shard.{000000..000059}.tar
+    samples_per_epoch: 9000
+    shuffle: true
+    buffer_size: 8000
+    drop_last: true
+
+  fomo_val:
+    # Same val shard range as vitl_baseline_4090 (001621-001626).
+    url: /mnt/nvme/projects/training-pure-ViT-real-life-bench/datasets/FOMO300/wds_with_dwi/shard.{001621..001626}.tar
+    samples_per_epoch: 900
+    shuffle: false
+    buffer_size: 900
+    drop_last: false
+
+checkpoint_period: 20
+max_checkpoints: 1
+
+wandb: true
+wandb_entity: palinaskipar-zdro-tech
+wandb_project: smri-fm-vitl-baseline-4090

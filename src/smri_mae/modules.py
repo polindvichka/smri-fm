@@ -53,6 +53,69 @@ def unpack_tokens(tokens: Tensor, token_mask: Tensor) -> Tensor:
     return output.index_put((token_mask,), tokens)
 
 
+def _rotate_half_axial(x: Tensor, chunk_dim: int, num_axes: int = 3) -> Tensor:
+    """rotate_half (standard RoPE (-x2, x1) swap) applied independently within
+    each of `num_axes` chunks of size `chunk_dim` at the front of the last
+    dim. Any trailing dims beyond num_axes*chunk_dim are left as zero here --
+    apply_rope_3d's cos/sin padding makes those an identity op (x*1 + 0*0).
+
+    x: [L, h, dh]
+    """
+    rotated_dim = chunk_dim * num_axes
+    x_rot, x_rest = x[..., :rotated_dim], x[..., rotated_dim:]
+    length, heads = x_rot.shape[0], x_rot.shape[1]
+    x_rot = x_rot.view(length, heads, num_axes, chunk_dim)
+    x1, x2 = x_rot.chunk(2, dim=-1)
+    x_rot = torch.cat([-x2, x1], dim=-1).reshape(length, heads, rotated_dim)
+    return torch.cat([x_rot, torch.zeros_like(x_rest)], dim=-1)
+
+
+def _rope_cos_sin(
+    positions: Float[Tensor, "L 3"],
+    inv_freq: Tensor,
+    chunk_dim: int,
+    head_dim: int,
+) -> tuple[Tensor, Tensor]:
+    """positions: per-token 3D grid coordinate, [L, 3]. inv_freq: [chunk_dim // 2],
+    shared frequency basis reused across all 3 spatial axes. Returns cos, sin
+    each [L, 1, head_dim] -- axis chunks laid out consecutively
+    [axis0 | axis1 | axis2 | identity remainder], matching _rotate_half_axial's
+    layout, ready to broadcast against a [L, h, head_dim] q/k tensor."""
+    length = positions.shape[0]
+    half = chunk_dim // 2
+    # [L, 3, half]
+    angles = positions.unsqueeze(-1).float() * inv_freq.view(1, 1, half)
+    # duplicate each axis's half-frequencies to fill its full chunk: [L, 3, chunk_dim]
+    angles = torch.cat([angles, angles], dim=-1)
+    angles = angles.reshape(length, 3 * chunk_dim)
+    remainder = head_dim - 3 * chunk_dim
+    if remainder > 0:
+        angles = torch.cat([angles, angles.new_zeros(length, remainder)], dim=-1)
+    cos = angles.cos().unsqueeze(1)
+    sin = angles.sin().unsqueeze(1)
+    return cos, sin
+
+
+def apply_rope_3d(
+    q: Tensor,
+    k: Tensor,
+    positions: Float[Tensor, "L 3"],
+    inv_freq: Tensor,
+    chunk_dim: int,
+) -> tuple[Tensor, Tensor]:
+    """3D-axial rotary position embedding: splits head_dim into 3 per-axis
+    chunks (one per spatial dimension) and rotates each chunk of q/k by an
+    angle proportional to that token's coordinate along the matching axis.
+    Any head_dim remainder beyond 3*chunk_dim is left unrotated. q, k: [L, h, dh].
+    """
+    head_dim = q.shape[-1]
+    cos, sin = _rope_cos_sin(positions, inv_freq, chunk_dim, head_dim)
+    cos, sin = cos.to(q.dtype), sin.to(q.dtype)
+    q_out = q * cos + _rotate_half_axial(q, chunk_dim) * sin
+    k_out = k * cos + _rotate_half_axial(k, chunk_dim) * sin
+    return q_out, k_out
+
+
 def jagged_scaled_dot_product_attention(
     query: Tensor,
     key: Tensor,
@@ -75,6 +138,8 @@ class Attention(nn.Module):
         num_heads: int,
         qkv_bias: bool = False,
         proj_bias: bool = False,
+        use_rope: bool = False,
+        rope_theta: float = 10000.0,
     ) -> None:
         super().__init__()
         self.num_heads = num_heads
@@ -82,19 +147,40 @@ class Attention(nn.Module):
         self.qkv = nn.Linear(dim, 3 * dim, bias=qkv_bias)
         self.proj = nn.Linear(dim, dim, bias=proj_bias)
 
+        # 3D-axial RoPE: head_dim is split into 3 per-axis chunks (largest
+        # even size <= head_dim // 3); any remainder dims are left unrotated.
+        # See apply_rope_3d in this module for the actual rotation.
+        self.use_rope = use_rope
+        self.rope_chunk_dim = 2 * ((self.head_dim // 3) // 2) if use_rope else 0
+        if self.rope_chunk_dim > 0:
+            inv_freq = 1.0 / (
+                rope_theta
+                ** (torch.arange(0, self.rope_chunk_dim, 2).float() / self.rope_chunk_dim)
+            )
+            self.register_buffer("rope_inv_freq", inv_freq, persistent=False)
+        else:
+            self.rope_inv_freq = None
+
     def extra_repr(self):
-        return f"num_heads={self.num_heads}"
+        extra = f"num_heads={self.num_heads}"
+        if self.use_rope:
+            extra += f", rope_chunk_dim={self.rope_chunk_dim}"
+        return extra
 
     def forward(
         self,
         x: Float[Tensor, "L D"],
         jagged_batch: JaggedBatch,
+        positions: Float[Tensor, "L 3"] | None = None,
     ) -> Float[Tensor, "L D"]:
         L, D = x.shape
         h, dh = self.num_heads, self.head_dim
 
         qkv = self.qkv(x).reshape(L, 3, h, dh)
         q, k, v = qkv.unbind(1)
+
+        if self.rope_chunk_dim > 0 and positions is not None:
+            q, k = apply_rope_3d(q, k, positions, self.rope_inv_freq, self.rope_chunk_dim)
 
         x = jagged_scaled_dot_product_attention(
             q,
@@ -141,6 +227,8 @@ class Block(nn.Module):
         mlp_ratio: int | float = 4,
         drop_path: float = 0.0,
         norm_layer: Layer = LayerNorm,
+        use_rope: bool = False,
+        rope_theta: float = 10000.0,
     ) -> None:
         super().__init__()
         self.norm1 = norm_layer(dim)
@@ -149,6 +237,8 @@ class Block(nn.Module):
             num_heads=num_heads,
             qkv_bias=qkv_bias,
             proj_bias=proj_bias,
+            use_rope=use_rope,
+            rope_theta=rope_theta,
         )
         self.drop_path1 = DropPath(drop_path) if drop_path > 0 else nn.Identity()
 
@@ -164,11 +254,13 @@ class Block(nn.Module):
         self,
         x: Float[Tensor, "L D"],
         jagged_batch: JaggedBatch,
+        positions: Float[Tensor, "L 3"] | None = None,
     ) -> Float[Tensor, "L D"]:
         x = x + self.drop_path1(
             self.attn(
                 self.norm1(x),
                 jagged_batch=jagged_batch,
+                positions=positions,
             )
         )
         x = x + self.drop_path2(self.mlp(self.norm2(x)))
