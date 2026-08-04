@@ -1,0 +1,110 @@
+# Overrides merged on top of src/smri_mae/config/default_pretrain.yaml.
+#
+# 50k-scale confirmation of the vitl_rope_targetnorm_4090 combined run
+# (RoPE + per-patch target normalization together). Same data range,
+# epochs, and schedule as vitl_baseline_50k / vitl_targetnorm_50k /
+# vitl_rope_50k -- single variable here is having BOTH tricks on at once,
+# to see whether the two effects stack, overlap, or interact badly at
+# this scale. At 9k/4090 the combo measured -45.8% vs baseline raw_mse,
+# clearly better than either alone (RoPE -33.0%, target_norm -3.4%) --
+# this run is what actually confirms whether that holds, the same way
+# the other 50k runs confirmed/refuted their own 9k screens.
+#
+# Hardware: the other *_50k configs (baseline/targetnorm/multiscale/
+# coarse2fine/rope) all ran on a single 96GB card at batch_size=64,
+# accum_iter=1 (global batch 64). That card isn't available here --
+# this run is on 2x RTX 5090 (32GB each) instead, over DDP (launch with
+# `torchrun --nproc_per_node=2`, no code changes needed, see
+# utils.init_distributed_mode's RANK/WORLD_SIZE/LOCAL_RANK detection).
+#
+# batch_size/accum_iter: to keep the SAME global batch of 64 as every
+# other 50k run (so training dynamics / LR scaling stay comparable, not
+# just the data), split 64 across 2 GPUs x accum instead of one GPU x1:
+# batch_size=16, accum_iter=2, num_gpus=2 -> 16*2*2 = 64 global, same as
+# baseline. Memory estimate (fit from real measurements: the 4090 combined
+# run's smoke test measured 18.9GB peak at micro-batch 12, and the
+# standalone rope_4090 config's own benchmarks logged 38.8GB at
+# micro-batch 30 and 68.8GB at micro-batch 60, all giving ~6.8GB fixed +
+# ~1.03GB/sample) -> micro-batch 16 should peak around ~23GB, comfortable
+# headroom under each 5090's 32GB. Worth a smoke test before the full
+# run regardless, same as the 4090 run got, since this is a new GPU class
+# and a DDP launch, both unverified assumptions until actually run.
+#
+# Same data cache, same everything else as vitl_baseline_50k otherwise --
+# see that config's comments for the sizing/shard-range reasoning, not
+# repeated here.
+
+name: vitl_rope_targetnorm_50k
+notes: >
+  50k-scale confirmation of combining RoPE (use_rope=true) and per-patch
+  target normalization (target_norm=patch), the two tricks that held up
+  individually at 50k, applied together on top of the same ViT-L /
+  full-resolution / FOMO300+DWI baseline recipe as vitl_baseline_50k.
+  At 9k/4090 the combo measured -45.8% vs baseline, notably better than
+  either alone -- this run tests whether that holds at scale, the same
+  way vitl_targetnorm_50k / vitl_rope_50k confirmed their own 9k screens.
+
+model: mae_vit_large
+img_size: [208, 240, 208]
+patch_size: 8
+mask_ratio: 0.8
+
+model_kwargs:
+  use_rope: true
+  target_norm: patch
+  decoder_depth: 4
+  reg_tokens: 0
+  class_token: true
+  no_embed_class: false
+  mask_drop_scale: false
+  drop_path_rate: 0.0
+
+output_dir: /workspace/checkpoints/experiments/vitl_rope_targetnorm_50k
+
+datasets:
+  fomo_train:
+    url: /workspace/data/fomo_50k/train/shard.{000000..000333}.tar
+    samples_per_epoch: 50000
+    shuffle: true
+    buffer_size: 8000
+    drop_last: true
+  fomo_val:
+    url: /workspace/data/fomo_50k/val/shard.{001621..001657}.tar
+    samples_per_epoch: 5500
+    shuffle: false
+    buffer_size: 1000
+    drop_last: false
+
+train_dataset: fomo_train
+eval_datasets: [fomo_val]
+
+epochs: 100
+warmup_epochs: 10
+batch_size: 16
+accum_iter: 2
+base_lr: 0.001
+min_lr: 1.0e-06
+weight_decay: 0.05
+betas: [0.9, 0.95]
+clip_grad: 1.0
+
+amp: true
+amp_dtype: bfloat16
+
+num_workers: 6
+prefetch_factor: 1
+presend_cuda: true
+
+checkpoint_period: 5
+max_checkpoints: 3
+eval_period: 5
+
+hf_repo_id: pau99/fomo26-checkpoints
+hf_subfolder: smri-fm-vitl-50k/rope_targetnorm
+
+wandb: true
+wandb_entity: palinaskipar-zdro-tech
+wandb_project: smri-fm-vitl-50k
+
+seed: 7338
+eval_seed: 7338
