@@ -99,8 +99,13 @@ checkpoint_period: 5
 max_checkpoints: 3
 eval_period: 5
 
-hf_repo_id: pau99/fomo26-checkpoints
-hf_subfolder: smri-fm-vitl-50k/rope_targetnorm
+hf_repo_id: null
+hf_subfolder: null
+# no periodic HF sync during training (unlike the other *_50k configs) --
+# only the final checkpoint-00099.pth gets uploaded, done post-hoc by a
+# watcher script once the run finishes, same pattern as the 4090 combined
+# run. Checkpoints still save locally throughout per checkpoint_period/
+# max_checkpoints above, this only disables the automatic remote sync.
 
 wandb: true
 wandb_entity: palinaskipar-zdro-tech
