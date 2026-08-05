@@ -1,0 +1,107 @@
+# Overrides merged on top of src/smri_mae/config/default_pretrain.yaml.
+#
+# Multi-scale decoder input (fuse encoder blocks 7/15/23 of 24, instead of
+# only the final block), same recipe as vitl_multiscale_full, but scaled
+# down to a ~50k-sample training set instead of the full FOMO300+DWI data
+# (270k+ samples). Meant as a scale-consistency check against the
+# vitl_multiscale_4090 (9k-sample) screen and the paused vitl_multiscale_full
+# run (stopped at epoch 25, full-scale result was ambiguous/near-tied vs
+# baseline at that point) -- without committing more full-scale GPU time.
+#
+# Dataset sizing (shards hold ~150 samples each, same as the full recipe):
+# - train: shards 000000-000333 (334 shards, ~50100-sample capacity),
+#   samples_per_epoch capped at 50000.
+# - val: shards 001621-001657 (37 shards, ~5550-sample capacity),
+#   samples_per_epoch capped at 5500 -- keeps the same ~11% val ratio as
+#   the full recipe (26880/243200), and is a SUBSET of the exact held-out
+#   val shard range (001621-001800) already used by vitl_baseline_full /
+#   vitl_multiscale_full / vitl_targetnorm_full / vitl_coarse2fine_full, so
+#   it never overlaps with any train range (full or reduced) and eval
+#   losses stay comparable across all experiments.
+#
+# Everything else (model, img_size, patch_size, mask_ratio, epochs, warmup,
+# lr, batch_size) is unchanged from vitl_multiscale_full -- main variable
+# here is dataset scale, matching vitl_baseline_50k / vitl_targetnorm_50k /
+# vitl_coarse2fine_50k exactly (same train/val shard ranges, same schedule,
+# same eval_period). Compare against vitl_baseline_50k's eval/fomo_val/loss
+# directly -- multiscale doesn't touch the loss function, so no metric
+# adjustment needed (same as the full-scale/4090 comparisons).
+#
+# eval_period: 5 (default_pretrain.yaml default is 10) -- evals every 5
+# epochs instead of every 10 for this smaller/faster run, matching the
+# other *_50k configs.
+
+name: vitl_multiscale_50k
+notes: >
+  Multi-scale decoder input (fuse encoder blocks 7/15/23 of 24, instead of
+  only the final block), same as vitl_multiscale_full, but on a ~50k-sample
+  subset of FOMO300+DWI (shards 000000-000333) instead of the full dataset.
+  Val set (shards 001621-001657) is a subset of the same held-out range
+  used by the full-scale experiments. Scale-consistency check against the
+  9k-sample vitl_multiscale_4090 screen and the paused full-scale run,
+  compared against vitl_baseline_50k.
+
+model: mae_vit_large
+img_size: [208, 240, 208]
+patch_size: 8
+mask_ratio: 0.8
+
+model_kwargs:
+  target_norm: none
+  decoder_depth: 4
+  reg_tokens: 0
+  class_token: true
+  no_embed_class: false
+  mask_drop_scale: false
+  drop_path_rate: 0.0
+  multiscale_layers: [7, 15, 23]
+
+output_dir: /mnt/nvme/projects/training-pure-ViT-real-life-bench/checkpoints/experiments/vitl_multiscale_50k
+
+datasets:
+  fomo_train:
+    url: /mnt/nvme/projects/training-pure-ViT-real-life-bench/datasets/FOMO300/wds_with_dwi/shard.{000000..000333}.tar
+    samples_per_epoch: 50000
+    shuffle: true
+    buffer_size: 8000
+    drop_last: true
+  fomo_val:
+    url: /mnt/nvme/projects/training-pure-ViT-real-life-bench/datasets/FOMO300/wds_with_dwi/shard.{001621..001657}.tar
+    samples_per_epoch: 5500
+    shuffle: false
+    buffer_size: 1000
+    drop_last: false
+
+train_dataset: fomo_train
+eval_datasets: [fomo_val]
+
+epochs: 100
+warmup_epochs: 10
+batch_size: 64
+accum_iter: 1
+base_lr: 0.001
+min_lr: 1.0e-06
+weight_decay: 0.05
+betas: [0.9, 0.95]
+clip_grad: 1.0
+
+amp: true
+amp_dtype: bfloat16
+
+num_workers: 6
+prefetch_factor: 1
+presend_cuda: true
+
+checkpoint_period: 5
+max_checkpoints: 3
+eval_period: 5
+
+hf_repo_id: pau99/fomo26-checkpoints
+hf_subfolder: smri-fm-vitl-50k/multiscale
+
+wandb: true
+wandb_entity: palinaskipar-zdro-tech
+wandb_project: smri-fm-vitl-50k
+
+seed: 7338
+eval_seed: 7338

@@ -75,6 +75,7 @@ class MaskedEncoder(nn.Module):
         mask_drop_scale: bool = False,
         use_rope: bool = False,
         rope_theta: float = 10000.0,
+        multiscale_layers: Sequence[int] | None = None,
     ):
         super().__init__()
         self.num_prefix_tokens = int(class_token) + reg_tokens
@@ -123,6 +124,18 @@ class MaskedEncoder(nn.Module):
         )
 
         self.norm = LayerNorm(embed_dim) if final_norm else nn.Identity()
+
+        # Optional multi-scale decoder input: fuse several intermediate block
+        # outputs (0-indexed, in addition to whichever is last) instead of
+        # feeding the decoder only the final block's output. None/empty
+        # preserves the original single-layer behavior exactly (see
+        # forward_patch_embeds) -- this is purely additive.
+        self.multiscale_layers = sorted(set(multiscale_layers)) if multiscale_layers else None
+        if self.multiscale_layers:
+            self.multiscale_norms = nn.ModuleList(
+                [LayerNorm(embed_dim) for _ in self.multiscale_layers]
+            )
+            self.multiscale_fuse = nn.Linear(len(self.multiscale_layers) * embed_dim, embed_dim)
 
         self.reset_parameters()
 
@@ -292,9 +305,21 @@ class MaskedEncoder(nn.Module):
 
         jagged_batch = JaggedBatch.from_mask(token_mask)
         x = x[token_mask]
-        for block in self.blocks:
-            x = block(x, jagged_batch=jagged_batch, positions=flat_positions)
-        x = self.norm(x)
+        if self.multiscale_layers:
+            taps = []
+            for ii, block in enumerate(self.blocks):
+                x = block(x, jagged_batch=jagged_batch, positions=flat_positions)
+                if ii in self.multiscale_layers:
+                    taps.append(x)
+            # all taps share the same packed token order (masking/packing is
+            # fixed for this forward call), so a per-token feature-dim concat
+            # lines up correctly without any unpacking in between.
+            normed_taps = [norm(tap) for norm, tap in zip(self.multiscale_norms, taps)]
+            x = self.multiscale_fuse(torch.cat(normed_taps, dim=-1))
+        else:
+            for block in self.blocks:
+                x = block(x, jagged_batch=jagged_batch, positions=flat_positions)
+            x = self.norm(x)
         x = unpack_tokens(x, token_mask)
 
         cls_embeds, reg_embeds, patch_embeds = self.chunk_tokens(x)
@@ -556,6 +581,7 @@ class MaskedAutoencoderViT(nn.Module, PyTorchModelHubMixin):
         target_norm: Literal["none", "global", "slice", "patch"] | None = None,
         use_rope: bool = False,
         rope_theta: float = 10000.0,
+        multiscale_layers: Sequence[int] | None = None,
     ):
         super().__init__()
         img_size = _to_3d_tuple(img_size, "img_size")
@@ -597,6 +623,7 @@ class MaskedAutoencoderViT(nn.Module, PyTorchModelHubMixin):
             mask_drop_scale=mask_drop_scale,
             use_rope=use_rope,
             rope_theta=rope_theta,
+            multiscale_layers=multiscale_layers,
         )
 
         self.pred_patchify = patchify
