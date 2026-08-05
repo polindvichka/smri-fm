@@ -9,8 +9,12 @@ import argparse
 import datetime
 import json
 import math
+import os
+import queue
 import random
+import shutil
 import subprocess
+import threading
 import time
 from contextlib import nullcontext
 from functools import partial
@@ -184,7 +188,7 @@ def main(args: DictConfig):
 
         ut.save_model(args, epoch, model_without_ddp, optimizer, loss_scaler)
         sync_checkpoints_to_r2(args, output_dir)
-        sync_checkpoints_to_hf(args, output_dir)
+        sync_checkpoints_to_hf(args, output_dir, epoch, wait=(epoch == args.epochs - 1))
 
     if args.distributed:
         torch.distributed.destroy_process_group()
@@ -242,44 +246,121 @@ def sync_checkpoints_to_r2(args: DictConfig, output_dir: Path) -> None:
     subprocess.run(cmd, check=True)
 
 
-def sync_checkpoints_to_hf(args: DictConfig, output_dir: Path) -> None:
-    """Upload output_dir (checkpoint + config/log/eval files) to the HF Hub
-    repo/subfolder named by hf_repo_id/hf_subfolder, then delete any epoch
-    checkpoints on the Hub that are no longer kept locally (mirrors the
-    max_checkpoints cleanup save_model already did), so at most
-    max_checkpoints epoch checkpoints -- typically just one -- ever live on
-    the Hub. Blocking, like sync_checkpoints_to_r2: a run that finishes right
-    after this call must not exit before the final checkpoint's upload lands.
-    No-op if hf_repo_id isn't set.
+_hf_upload_queue: "queue.Queue | None" = None
+_hf_upload_thread: threading.Thread | None = None
+_hf_staging_dir: Path | None = None
+
+_HF_METADATA_PATTERNS = ("*.yaml", "*.json", "*.txt", "*.png")
+
+
+def _hf_upload_worker(hf_repo_id: str, subfolder: str, q: "queue.Queue") -> None:
+    from huggingface_hub import HfApi
+
+    api = HfApi()
+    while True:
+        item = q.get()
+        if item is None:
+            q.task_done()
+            return
+        staging_dir, checkpoint_name, epoch = item
+        try:
+            print(f"syncing checkpoint (epoch {epoch}) to HF Hub: {hf_repo_id}/{subfolder}")
+            api.upload_folder(
+                folder_path=str(staging_dir),
+                path_in_repo=subfolder,
+                repo_id=hf_repo_id,
+                repo_type="model",
+            )
+            # keep only the checkpoint we just uploaded on the Hub -- at most
+            # one ever lives there, regardless of local max_checkpoints.
+            prefix = f"{subfolder}/"
+            for remote_path in api.list_repo_files(hf_repo_id, repo_type="model"):
+                if not remote_path.startswith(prefix):
+                    continue
+                name = remote_path[len(prefix) :]
+                if (
+                    name.startswith("checkpoint-")
+                    and name.endswith(".pth")
+                    and name != checkpoint_name
+                ):
+                    print(f"removing superseded checkpoint from HF Hub: {remote_path}")
+                    api.delete_file(path_in_repo=remote_path, repo_id=hf_repo_id, repo_type="model")
+        except Exception as e:
+            print(f"HF Hub sync failed for epoch {epoch}: {e}")
+        finally:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            q.task_done()
+
+
+def sync_checkpoints_to_hf(
+    args: DictConfig, output_dir: Path, epoch: int, wait: bool = False
+) -> None:
+    """Queue this epoch's checkpoint (plus config/log/eval-plot files) for
+    upload to the HF Hub repo/subfolder named by hf_repo_id/hf_subfolder,
+    uploaded by a single persistent background worker thread, so training is
+    never blocked on the network.
+
+    No-op if hf_repo_id isn't set, or if save_model didn't checkpoint this
+    epoch (not on checkpoint_period).
+
+    Staging: everything about to be uploaded is snapshotted into a private
+    per-epoch folder under output_dir/.hf_staging/ the moment it's ready --
+    the checkpoint via hardlink (same filesystem, instant, no extra disk
+    space even for a multi-GB file), the small metadata files (log.json,
+    log.txt, config.yaml, eval plot pngs) via a real copy, since log.json/
+    log.txt keep growing every epoch and a hardlink would just point at
+    that same still-changing file. Without this, the background worker
+    could read a metadata file mid-mutation by the next epoch and produce
+    an upload whose content hash doesn't match what the Hub expects,
+    which HF rejects outright rather than silently corrupting anything.
+    Freezing everything into its own snapshot removes that race, and lets
+    save_model rotate/delete the original checkpoint immediately -- no
+    blocking wait is needed for that anymore either.
+
+    Hub-side retention: after each upload finishes, the worker deletes every
+    other checkpoint file on the Hub, so at most one checkpoint -- whichever
+    upload most recently finished -- ever lives there, independent of local
+    max_checkpoints. Pass wait=True (done automatically on the final epoch,
+    see main()) to block until this specific upload finishes and the worker
+    thread exits, so the run's last checkpoint is guaranteed to be the one
+    left on the Hub when the process exits.
     """
+    global _hf_upload_queue, _hf_upload_thread, _hf_staging_dir
     hf_repo_id = args.get("hf_repo_id")
     if not hf_repo_id or not ut.is_main_process():
         return
 
-    from huggingface_hub import HfApi
+    checkpoint_path = output_dir / f"checkpoint-{epoch:05d}.pth"
+    if not checkpoint_path.exists():
+        return
 
-    api = HfApi()
-    subfolder = args.get("hf_subfolder") or args.name
+    if _hf_upload_thread is None:
+        _hf_upload_queue = queue.Queue()
+        _hf_staging_dir = output_dir / ".hf_staging"
+        _hf_staging_dir.mkdir(exist_ok=True)
+        subfolder = args.get("hf_subfolder") or args.name
+        _hf_upload_thread = threading.Thread(
+            target=_hf_upload_worker,
+            args=(hf_repo_id, subfolder, _hf_upload_queue),
+            daemon=False,
+        )
+        _hf_upload_thread.start()
 
-    print(f"syncing checkpoints to HF Hub: {output_dir} -> {hf_repo_id}/{subfolder}")
-    api.upload_folder(
-        folder_path=str(output_dir),
-        path_in_repo=subfolder,
-        repo_id=hf_repo_id,
-        repo_type="model",
-        allow_patterns=["checkpoint-*.pth", "*.yaml", "*.json", "*.txt", "*.png"],
-    )
+    epoch_staging_dir = _hf_staging_dir / f"epoch_{epoch:05d}"
+    shutil.rmtree(epoch_staging_dir, ignore_errors=True)
+    epoch_staging_dir.mkdir(exist_ok=True)
+    os.link(checkpoint_path, epoch_staging_dir / checkpoint_path.name)
+    for pattern in _HF_METADATA_PATTERNS:
+        for src in output_dir.glob(pattern):
+            shutil.copy2(src, epoch_staging_dir / src.name)
 
-    kept_names = {p.name for p in output_dir.glob("checkpoint-[0-9]*.pth")}
-    kept_names.add("checkpoint-last.pth")
-    prefix = f"{subfolder}/"
-    for remote_path in api.list_repo_files(hf_repo_id, repo_type="model"):
-        if not remote_path.startswith(prefix):
-            continue
-        name = remote_path[len(prefix) :]
-        if name.startswith("checkpoint-") and name.endswith(".pth") and name not in kept_names:
-            print(f"removing superseded checkpoint from HF Hub: {remote_path}")
-            api.delete_file(path_in_repo=remote_path, repo_id=hf_repo_id, repo_type="model")
+    _hf_upload_queue.put((epoch_staging_dir, checkpoint_path.name, epoch))
+
+    if wait:
+        _hf_upload_queue.join()
+        _hf_upload_queue.put(None)
+        _hf_upload_thread.join()
+        _hf_upload_thread = None
 
 
 def train_one_epoch(
