@@ -40,7 +40,7 @@ tested or required).
 ## How correctness is checked
 
 Via `perf_parity.run_op_parity`, exactly like every other M6 op-parity test
-in this codebase (`test_tuned_linear.py`): forward output and every leaf's
+in this codebase: forward output and every leaf's
 backward gradient are compared, via PCC, against the *existing,
 already-verified* `bidirectional_scaled_dot_product_attention` as the
 reference -- not against a fresh numpy re-derivation, since the point here is

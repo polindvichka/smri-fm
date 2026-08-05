@@ -248,18 +248,13 @@ class MaskedAutoencoderViTTT(AbstractModuleBase):
         params: ModelParams,
         mlp_ratio: float = 4.0,
         use_tuned_gelu: bool = False,
-        use_tuned_linear: bool = False,
     ) -> None:
         super().__init__()
         self.contract = contract
         self.encoder_depth = encoder_depth
         self.decoder_depth = decoder_depth
-        self.encoder = Encoder(
-            contract, depth=encoder_depth, params=params.encoder, mlp_ratio=mlp_ratio, use_tuned_gelu=use_tuned_gelu, use_tuned_linear=use_tuned_linear
-        )
-        self.decoder = Decoder(
-            contract, depth=decoder_depth, params=params.decoder, mlp_ratio=mlp_ratio, use_tuned_gelu=use_tuned_gelu, use_tuned_linear=use_tuned_linear
-        )
+        self.encoder = Encoder(contract, depth=encoder_depth, params=params.encoder, mlp_ratio=mlp_ratio, use_tuned_gelu=use_tuned_gelu)
+        self.decoder = Decoder(contract, depth=decoder_depth, params=params.decoder, mlp_ratio=mlp_ratio, use_tuned_gelu=use_tuned_gelu)
 
     def forward_encoder(
         self, visible_values: np.ndarray, visible_ids: np.ndarray

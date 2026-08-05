@@ -17,10 +17,12 @@ wheel) -- `ttml.ops.unary.gelu`'s C++ wrapper (`unary_ops.cpp`) just never
 passes a non-default value through. So the entire fix is a pure-Python
 `ttml.autograd.Function` wrapping the already-shipped, already-tested raw
 `ttnn` ops with an explicit `variant` argument -- no `tenstorrent/tt-metal`
-file is touched, no rebuild is needed, same "Python-level knob, not a
-vendored kernel edit" category `ops_tt/tuned_linear.py`'s module docstring
-already established for matmul (though that one turned out to be a dead
-end; this one measures as a real win, see below).
+file is touched, no rebuild is needed. A since-reverted `ops_tt/tuned_linear.py`
+tried the analogous "Python-level knob, not a vendored kernel edit" approach
+for matmul (real ~2% e2e win, but reverted 2026-08-05 for its added
+complexity -- see `TENSTORRENT_PORT.md` section 5); this GELU op measures
+as a comparably real win with far less machinery (no cache file, no sweep
+script), which is why it stayed.
 
 ## Measured: FastLut forward is a real ~1.7-1.8x speedup, PCC comfortably
 ## clears the forward gate
@@ -84,11 +86,10 @@ standing gate every other op-level change in this project is held to).
 
 ## Scope
 
-Opt-in only (`use_tuned_gelu`, default `False`, mirrors `Mlp`'s existing
-`use_tuned_linear` flag) -- `Mlp.forward` swaps `ttml.ops.unary.gelu` for
-`tuned_gelu` when set. No shape restriction beyond what `ttnn.gelu`/
-`gelu_bw` themselves require (any tile-aligned tensor `Mlp` already produces
-qualifies -- unlike `tuned_linear`, this op has no grid/program-config
+Opt-in flag (`use_tuned_gelu`, default `True` in `train()`) -- `Mlp.forward`
+swaps `ttml.ops.unary.gelu` for `tuned_gelu` when set. No shape restriction
+beyond what `ttnn.gelu`/`gelu_bw` themselves require (any tile-aligned
+tensor `Mlp` already produces qualifies -- no grid/program-config
 divisibility constraint to fail fast on).
 """
 

@@ -323,7 +323,6 @@ def train(
     on_step_timing: Optional[Callable[[int, float], None]] = None,
     on_stage_timing: Optional[Callable[[int, str, float], None]] = None,
     use_tuned_gelu: bool = True,
-    use_tuned_linear: bool = False,
 ) -> list[StepLog]:
     """Run `num_steps` optimizer steps of `MaskedAutoencoderViTTT` on a
     single-device `MeshContext`, per TENSTORRENT_PORT.md section 7's M5
@@ -398,22 +397,18 @@ def train(
     vendored-kernel risk. Pass `False` to recover the exact prior GELU math
     (e.g. to reproduce results captured before this default changed).
 
-    `use_tuned_linear` (M6, default `False`): forwarded to `MaskedAutoencoderViTTT`
-    -- see `ops_tt.tuned_linear.TunedLinearLayer`'s docstring.
-    `scripts/sweep_mm_block_sizes.py` measures real, PCC-verified matmul
-    `program_config`s per exact `(batch, seq_len, in_features, out_features)`
-    shape and caches them (`ops_tt/mm_program_config_cache.json`); a cache
-    miss falls back to `program_config=None`, numerically the *same*
-    `ttnn.linear` default the covered path also builds on -- but even a
-    cache miss still routes through `TunedLinearLayer`/`ttnn.linear` instead
-    of `ttml.modules.LinearLayer`/`ttml.ops.linear.linear`, and empirically
-    those two produce tiny bf16 rounding differences (confirmed: flipping
-    this default broke `test_golden_baseline.py`'s tight-tolerance
-    regression gate on a shape with no cache entry at all). So, unlike
-    `use_tuned_gelu`, this stays opt-in per call rather than a default-on
-    verified win -- pass `True` explicitly once a specific shape's cached
-    config has been measured to actually help end-to-end (`scripts/
-    bench_step.py --tuned-linear`).
+    (M6 note: `ops_tt.tuned_linear.TunedLinearLayer` -- a per-shape tuned
+    matmul `program_config` cache, ~2% e2e win -- and two vendored SDPA
+    backward-KV kernel micro-optimizations (Q/dO group-cache reader,
+    7->6-cycle fused kernel; ~1.3%/~0.35% e2e) were tried, shipped, then
+    reverted 2026-08-05 in favor of stability: real but small gains, bespoke
+    to this project, not upstream-contributable, and (for the two vendored
+    kernel changes) touching the exact kernel family responsible for every
+    device hang found during this port's optimization work. See
+    `TENSTORRENT_PORT.md` section 5 for the full history. `use_tuned_gelu`
+    above and the B17 `sfpu_reduce` fusion in the vendored `sdpa_bw` kernel
+    were kept: verified wins/precision improvements built on documented
+    public APIs, no hang history.)
     """
     if accum_iter < 1:
         raise ValueError(f"accum_iter must be >= 1, got {accum_iter}")
@@ -438,7 +433,6 @@ def train(
             ModelParams(encoder=encoder_params, decoder=decoder_params),
             mlp_ratio=mlp_ratio,
             use_tuned_gelu=use_tuned_gelu,
-            use_tuned_linear=use_tuned_linear,
         )
 
         if resume_checkpoint is not None:

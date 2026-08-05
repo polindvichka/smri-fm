@@ -62,7 +62,6 @@ def bench(
     prefetch: bool,
     seed: int,
     use_tuned_gelu: bool = True,
-    use_tuned_linear: bool = False,
 ) -> list[float]:
     """Runs `steps` real training steps at `preset`'s shape/depth, returns
     the per-step wall-clock seconds measured by `train()`'s `on_step_timing`
@@ -99,7 +98,6 @@ def bench(
         prefetch=prefetch,
         on_step_timing=lambda step, elapsed: step_times.append(elapsed),
         use_tuned_gelu=use_tuned_gelu,
-        use_tuned_linear=use_tuned_linear,
     )
     return step_times
 
@@ -113,12 +111,11 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--log-file", type=str, default=None, help="optional path to dump raw per-step seconds as JSON")
     parser.add_argument("--no-tuned-gelu", dest="use_tuned_gelu", action="store_false", default=True, help="M6: disable ops_tt.tuned_gelu (ttnn.gelu variant=FastLut, train()'s default since it's a verified win) to isolate the pre-M6-GELU-fix baseline")
-    parser.add_argument("--tuned-linear", dest="use_tuned_linear", action="store_true", default=False, help="M6: enable ops_tt.tuned_linear (sweep-cached matmul program_config -- opt-in, not train()'s default, see main_pretrain_tt.train()'s docstring for why)")
     args = parser.parse_args(argv)
 
     print(
         f"bench_step: preset={args.preset} steps={args.steps} warmup_steps={args.warmup_steps} prefetch={args.prefetch} "
-        f"seed={args.seed} use_tuned_gelu={args.use_tuned_gelu} use_tuned_linear={args.use_tuned_linear}",
+        f"seed={args.seed} use_tuned_gelu={args.use_tuned_gelu}",
         flush=True,
     )
     step_times = bench(
@@ -128,7 +125,6 @@ def main(argv: list[str] | None = None) -> None:
         prefetch=args.prefetch,
         seed=args.seed,
         use_tuned_gelu=args.use_tuned_gelu,
-        use_tuned_linear=args.use_tuned_linear,
     )
 
     print("\nper-step timing:", flush=True)
@@ -154,7 +150,6 @@ def main(argv: list[str] | None = None) -> None:
                     "prefetch": args.prefetch,
                     "seed": args.seed,
                     "use_tuned_gelu": args.use_tuned_gelu,
-                    "use_tuned_linear": args.use_tuned_linear,
                     "step_seconds": step_times,
                     "warmup_steps": args.warmup_steps,
                     "avg_ms": avg_ms,

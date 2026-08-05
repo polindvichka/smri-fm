@@ -76,7 +76,6 @@ from smri_mae_tt.layout import ShapeContract
 from smri_mae_tt.ops_tt.attention import bidirectional_scaled_dot_product_attention
 from smri_mae_tt.ops_tt.concat import autograd_concat, autograd_slice
 from smri_mae_tt.ops_tt.tuned_gelu import tuned_gelu
-from smri_mae_tt.ops_tt.tuned_linear import TunedLinearLayer
 
 from ttml.modules import AbstractModuleBase, Buffer, LinearLayer, ModuleList, Parameter
 
@@ -493,14 +492,6 @@ class Attention(AbstractModuleBase):
     batch: `bidirectional_scaled_dot_product_attention` (`ops_tt/attention.py`)
     already runs plain dense bidirectional attention over the fixed `seq_len`
     this port's static shape contract fixes ahead of time.
-
-    `use_tuned_linear` (M6, default `False`): when `True`, `qkv`/`proj` are
-    built as `ops_tt.tuned_linear.TunedLinearLayer` (explicit tuned
-    `program_config` matmul, see that module) instead of
-    `ttml.modules.LinearLayer`. Opt-in only -- every existing call site keeps
-    `use_tuned_linear=False` and gets exactly the prior behavior
-    (`ops_tt/test_tuned_linear.py` verifies the two layers agree within the
-    same PCC gates `perf_parity.py` uses everywhere else in this port).
     """
 
     def __init__(
@@ -509,7 +500,6 @@ class Attention(AbstractModuleBase):
         num_heads: int,
         params: BlockParams,
         qkv_mlp_dtype: "ttnn.DataType" = ttnn.DataType.BFLOAT16,
-        use_tuned_linear: bool = False,
     ) -> None:
         super().__init__()
         if dim % num_heads != 0:
@@ -556,9 +546,8 @@ class Attention(AbstractModuleBase):
         # named in that policy and stays BFLOAT16 unconditionally -- it is not
         # "QKV" or "MLP", and applying bfp8 to it would be an undocumented
         # extension of the doc's guidance, not a literal reading of it.
-        linear_cls = TunedLinearLayer if use_tuned_linear else LinearLayer
-        self.qkv = linear_cls(dim, 3 * dim, True, weight_init=_const_init(params.qkv.weight, qkv_mlp_dtype), bias_init=_const_init(params.qkv.bias))
-        self.proj = linear_cls(dim, dim, True, weight_init=_const_init(params.proj.weight), bias_init=_const_init(params.proj.bias))
+        self.qkv = LinearLayer(dim, 3 * dim, True, weight_init=_const_init(params.qkv.weight, qkv_mlp_dtype), bias_init=_const_init(params.qkv.bias))
+        self.proj = LinearLayer(dim, dim, True, weight_init=_const_init(params.proj.weight), bias_init=_const_init(params.proj.bias))
 
     def forward(self, x: "ttml.autograd.Tensor", seq_len: int) -> "ttml.autograd.Tensor":
         qkv = self.qkv(x)
@@ -573,10 +562,6 @@ class Mlp(AbstractModuleBase):
     reference's `Mlp` never had any (only `Block`'s residual paths do, via
     `DropPath`, itself omitted below since `drop_path_rate: 0.0` always in
     this project's config).
-
-    `use_tuned_linear` (M6, default `False`): see `Attention`'s docstring --
-    same opt-in flag, same `TunedLinearLayer` swap, here applied to
-    `fc1`/`fc2`.
 
     `use_tuned_gelu` (M6, default `False`): when `True`, the GELU activation
     between `fc1`/`fc2` uses `ops_tt.tuned_gelu.tuned_gelu` (forward via
@@ -593,14 +578,12 @@ class Mlp(AbstractModuleBase):
         mlp_ratio: float,
         params: BlockParams,
         qkv_mlp_dtype: "ttnn.DataType" = ttnn.DataType.BFLOAT16,
-        use_tuned_linear: bool = False,
         use_tuned_gelu: bool = False,
     ) -> None:
         super().__init__()
         hidden = int(dim * mlp_ratio)
-        linear_cls = TunedLinearLayer if use_tuned_linear else LinearLayer
-        self.fc1 = linear_cls(dim, hidden, True, weight_init=_const_init(params.fc1.weight, qkv_mlp_dtype), bias_init=_const_init(params.fc1.bias))
-        self.fc2 = linear_cls(hidden, dim, True, weight_init=_const_init(params.fc2.weight, qkv_mlp_dtype), bias_init=_const_init(params.fc2.bias))
+        self.fc1 = LinearLayer(dim, hidden, True, weight_init=_const_init(params.fc1.weight, qkv_mlp_dtype), bias_init=_const_init(params.fc1.bias))
+        self.fc2 = LinearLayer(hidden, dim, True, weight_init=_const_init(params.fc2.weight, qkv_mlp_dtype), bias_init=_const_init(params.fc2.bias))
         self._gelu = tuned_gelu if use_tuned_gelu else ttml.ops.unary.gelu
 
     def forward(self, x: "ttml.autograd.Tensor") -> "ttml.autograd.Tensor":
@@ -618,10 +601,6 @@ class TransformerBlock(AbstractModuleBase):
     `DropPath(0.0)` is `nn.Identity()` in the reference already -- building
     a real drop-path code path here would be dead code for this port.
 
-    `use_tuned_linear` (M6, default `False`): forwarded to `Attention`/`Mlp`
-    unchanged -- see `Attention`'s docstring. Opt-in only; every existing
-    caller (`Encoder`/`Decoder` below) keeps the default `False`.
-
     `use_tuned_gelu` (M6, default `False`): forwarded to `Mlp` unchanged --
     see `Mlp`'s docstring.
     """
@@ -634,15 +613,14 @@ class TransformerBlock(AbstractModuleBase):
         params: BlockParams,
         seq_len: int,
         qkv_mlp_dtype: "ttnn.DataType" = ttnn.DataType.BFLOAT16,
-        use_tuned_linear: bool = False,
         use_tuned_gelu: bool = False,
     ) -> None:
         super().__init__()
         self.seq_len = seq_len
         self.norm1 = LayerNorm(dim, params.ln1)
-        self.attn = Attention(dim, num_heads, params, qkv_mlp_dtype=qkv_mlp_dtype, use_tuned_linear=use_tuned_linear)
+        self.attn = Attention(dim, num_heads, params, qkv_mlp_dtype=qkv_mlp_dtype)
         self.norm2 = LayerNorm(dim, params.ln2)
-        self.mlp = Mlp(dim, mlp_ratio, params, qkv_mlp_dtype=qkv_mlp_dtype, use_tuned_linear=use_tuned_linear, use_tuned_gelu=use_tuned_gelu)
+        self.mlp = Mlp(dim, mlp_ratio, params, qkv_mlp_dtype=qkv_mlp_dtype, use_tuned_gelu=use_tuned_gelu)
 
     def forward(self, x: "ttml.autograd.Tensor") -> "ttml.autograd.Tensor":
         residual = x
@@ -671,11 +649,6 @@ class Encoder(AbstractModuleBase):
 
     `use_tuned_gelu` (M6, default `False`): forwarded to every block's `Mlp`
     -- see `modules_tt.Mlp`'s docstring.
-
-    `use_tuned_linear` (M6, default `False`): forwarded to every block's
-    `Attention`/`Mlp` -- see `Attention`'s docstring. Safe to enable
-    unconditionally (uncovered shapes are a no-op, see `ops_tt.tuned_linear.
-    TunedLinearLayer`'s docstring).
     """
 
     def __init__(
@@ -685,7 +658,6 @@ class Encoder(AbstractModuleBase):
         params: EncoderParams,
         mlp_ratio: float = 4.0,
         use_tuned_gelu: bool = False,
-        use_tuned_linear: bool = False,
     ) -> None:
         super().__init__()
         self.contract = contract
@@ -705,7 +677,6 @@ class Encoder(AbstractModuleBase):
                     params.blocks[i],
                     seq_len=contract.encoder_seq_len,
                     use_tuned_gelu=use_tuned_gelu,
-                    use_tuned_linear=use_tuned_linear,
                 )
                 for i in range(depth)
             ]
@@ -756,11 +727,6 @@ class Decoder(AbstractModuleBase):
 
     `use_tuned_gelu` (M6, default `False`): forwarded to every block's `Mlp`
     -- see `modules_tt.Mlp`'s docstring.
-
-    `use_tuned_linear` (M6, default `False`): forwarded to every block's
-    `Attention`/`Mlp` -- see `Attention`'s docstring. Safe to enable
-    unconditionally (uncovered shapes are a no-op, see `ops_tt.tuned_linear.
-    TunedLinearLayer`'s docstring).
     """
 
     def __init__(
@@ -770,7 +736,6 @@ class Decoder(AbstractModuleBase):
         params: DecoderParams,
         mlp_ratio: float = 4.0,
         use_tuned_gelu: bool = False,
-        use_tuned_linear: bool = False,
     ) -> None:
         super().__init__()
         self.contract = contract
@@ -797,7 +762,6 @@ class Decoder(AbstractModuleBase):
                     seq_len=contract.decoder_seq_len,
                     qkv_mlp_dtype=ttnn.DataType.BFLOAT8_B,
                     use_tuned_gelu=use_tuned_gelu,
-                    use_tuned_linear=use_tuned_linear,
                 )
                 for i in range(depth)
             ]

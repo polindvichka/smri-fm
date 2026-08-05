@@ -38,6 +38,51 @@ computation) and are **bit-identical** in `GRAD_NORM` at this precision;
 confirmed bit-exact reproducible across two separate recapture runs before
 being recorded here, same standard as the original capture.
 
+**Recaptured again (2026-07-30)** when `train()`'s `use_tuned_linear` default
+flipped `False` -> `True` (`ops_tt.tuned_linear.TunedLinearLayer`, real
+~2% end-to-end step-time reduction at production scale, `TENSTORRENT_PORT.md`
+section 5 item 1 -- this smoke fixture's small `smoke_contract()` shapes have
+no sweep-cache entry, so every linear call here is the documented cache-miss
+`program_config=None` path, still numerically distinct from `ttml.ops.linear.
+linear` per `use_tuned_linear`'s own docstring). Same pattern as the
+`use_tuned_gelu` recapture above: `LOSS` shifts by ~1-5e-4 (e.g. step 0:
+`0.996826171875` -> `0.9970703125`), `GRAD_NORM` shifts by 0 to ~2e-3 (e.g.
+step 3: `0.2119140625` -> `0.2099609375`) -- bf16 rounding-bucket noise from
+routing through a different (but numerically equivalent by construction)
+code path, not a broken computation. Confirmed bit-exact reproducible across
+two separate recapture runs before being recorded here.
+
+**Recaptured again (2026-07-31)** for the vendored `sdpa_bw_compute_utils.hpp`
+change (`compute_u_scalar_row` now uses `sfpu_reduce<SUM, Float32, REDUCE_ROW>`
+directly on DST instead of a matmul-with-ones-vector CB roundtrip -- upstream
+Tenstorrent optimization B17, `tt-train/sources/ttml/metal/ops/
+SDPA_OPTIMIZATION_PROPOSALS.md`; see `TENSTORRENT_PORT.md` section 5). `LOSS`
+shifts by 0 to ~5e-4 (step 2: `0.880859375` -> `0.88037109375`), `GRAD_NORM`
+shifts by 0 to ~2e-3 (step 2: `0.1533203125` -> `0.154296875`, step 3:
+`0.2099609375` -> `0.2119140625`) -- same bf16 rounding-bucket noise pattern
+as both prior recaptures, not a broken computation (full gtest suite 10/10
+including production-scale PCC-gated coverage, and the rest of the full
+pytest suite, both passed unaffected). Confirmed bit-exact reproducible
+across two separate recapture runs before being recorded here.
+
+**Recaptured again (2026-08-05)** after a stability pass reverted three M6
+optimizations judged not worth their added complexity/risk for production
+use: `use_tuned_linear` (removed entirely -- `ops_tt/tuned_linear.py`, its
+sweep script, and its per-shape program_config cache all deleted) and the
+two vendored SDPA backward-KV kernel micro-optimizations (Q/dO group-cache
+reader, 7->6-cycle fused compute kernel -- both reverted to the original
+kernel `ttml`/tt-train shipped, still selected for every mask type). The
+B17 `sfpu_reduce` fusion (previous entry) was kept -- see
+`TENSTORRENT_PORT.md` section 5 for the full rationale. Net result at this
+fixture's tiny `smoke_contract()` scale: `LOSS` reverts exactly to its
+pre-`use_tuned_linear` values (step 0: `0.9970703125` -> `0.996826171875`,
+step 2: `0.88037109375` -> `0.881103515625` -- both match the recorded
+`use_tuned_gelu`-only recapture above bit-for-bit), `GRAD_NORM` is
+**unchanged at every step** -- neither the SDPA kernel reverts nor keeping
+B17 perturb this shape's bf16 rounding at all; `use_tuned_linear` was the
+only one of the three ever-shipped M6 changes that did. Confirmed bit-exact
+reproducible across two separate recapture runs before being recorded here.
+
 **Real shards, deterministic order**: `main_pretrain_tt.py` has no synthetic
 data path (its module docstring), so this fixture's `train_batch_fn` reads
 real MRI volumes -- `real_data.RealValSource(contract,
@@ -133,7 +178,7 @@ GOLDEN_STEP_LOSSES = [
     0.996826171875,
     1.08837890625,
     0.881103515625,
-    1.697021484375,
+    1.69677734375,
     1.011474609375,
 ]
 GOLDEN_STEP_GRAD_NORMS = [
