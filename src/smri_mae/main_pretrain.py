@@ -198,6 +198,13 @@ def main(args: DictConfig):
 
 
 def create_data_loaders(args: DictConfig):
+    if args.datasets[args.train_dataset].get("format") == "local_pt":
+        # Local-disk .pt files instead of real webdataset shards -- see
+        # experiments/coarse2fine_pretrain/README.md and src/data/local_pt_dataset.py.
+        from data.local_pt_dataset import create_local_data_loaders
+
+        return create_local_data_loaders(args)
+
     data_loaders = {}
     dataset_names = [args.train_dataset] + args.eval_datasets
 
@@ -444,22 +451,31 @@ def train_one_epoch(
         if need_update and log_step:
             loss_value = loss_for_log.item()
             grad_norm_value = grad_norm.item()
-            # last_raw_mse is set on every forward_loss call regardless of
-            # target_norm (see model_mae.py) -- it's the same quantity the
-            # plain model logs as its whole loss, so it's the fair number
-            # to compare against that baseline, unlike `loss` above, which
-            # is scored on normalized targets and so runs on a different
-            # scale once target_norm is set.
-            raw_mse_module = model.module if args.distributed else model
-            raw_mse_value = raw_mse_module.last_raw_mse.item()
+            # last_raw_mse and last_fine_loss are both set on every
+            # forward_loss call regardless of target_norm/coarse_to_fine (see
+            # model_mae.py). raw_mse is the fully fair number to compare
+            # against a plain baseline -- de-normalized back to raw intensity
+            # scale AND excluding the coarse term -- unlike `loss` above,
+            # which is scored on normalized targets and includes the coarse
+            # term once those are active, so it runs on a different scale.
+            # fine_loss is also logged (normalized scale, no coarse term) as
+            # a useful secondary signal, same as it always was.
+            stats_module = model.module if args.distributed else model
+            raw_mse_value = stats_module.last_raw_mse.item()
+            fine_loss_value = stats_module.last_fine_loss.item()
             metric_logger.update(
-                loss=loss_value, raw_mse=raw_mse_value, lr=lr, grad=grad_norm_value
+                loss=loss_value,
+                raw_mse=raw_mse_value,
+                fine_loss=fine_loss_value,
+                lr=lr,
+                grad=grad_norm_value,
             )
             if log_wandb:
                 wandb.log(
                     {
                         "train/loss": loss_value,
                         "train/raw_mse": raw_mse_value,
+                        "train/fine_loss": fine_loss_value,
                         "train/lr": lr,
                         "train/grad": grad_norm_value,
                     },
@@ -540,11 +556,14 @@ def evaluate(
         if not finite.item():
             raise RuntimeError("non-finite validation loss detected")
         metric_logger.meters["loss"].update(loss_value, n=int(batch["img_mask"].shape[0]))
-        # see train_one_epoch's raw_mse comment: same quantity the plain
-        # model logs as its whole eval loss.
-        raw_mse_module = model.module if args.distributed else model
+        # see train_one_epoch's raw_mse/fine_loss comment: same quantities
+        # the plain model logs as its whole eval loss.
+        stats_module = model.module if args.distributed else model
         metric_logger.meters["raw_mse"].update(
-            raw_mse_module.last_raw_mse.item(), n=int(batch["img_mask"].shape[0])
+            stats_module.last_raw_mse.item(), n=int(batch["img_mask"].shape[0])
+        )
+        metric_logger.meters["fine_loss"].update(
+            stats_module.last_fine_loss.item(), n=int(batch["img_mask"].shape[0])
         )
 
         if is_master and batch_step == example_step:

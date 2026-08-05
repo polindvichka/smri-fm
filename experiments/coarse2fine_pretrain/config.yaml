@@ -1,0 +1,67 @@
+# Overrides merged on top of src/smri_mae/config/default_pretrain.yaml
+# (main_pretrain.py --cfg-path). Same comparability decisions as the sibling
+# edgeloss/ToMe experiments (see /workspace/smri-fm-edgeloss/experiments/edgeloss_pretrain/
+# and /workspace/smri-fm-tome/experiments/tome_pretrain/): mae_vit_small (not
+# the 316M-param default mae_vit_large) to stay in the same capacity ballpark
+# as the ResEncUNet-B/U-Net-B/Primus-S checkpoints these are meant to be
+# comparable to, same 160cube crop, same local .pt data adapter, same split.
+#
+# See experiments/coarse2fine_pretrain/README.md for background and how to run.
+
+name: coarse2fine_pretrain
+notes: >
+  Coarse-to-fine decoding: the decoder head first guesses each masked
+  patch's block-averaged ("big shape") version, then predicts a fine
+  residual on top of it, instead of predicting all voxels in one shot.
+  Loss = fine-voxel MSE (as in the original) + coarse_loss_weight * a second
+  MSE term on the coarse guess against a block-averaged target. Mirrors
+  sketching the overall shape before adding detail.
+  See src/smri_mae/modules.py (CoarseToFineHead, avgpool_patch3d,
+  upsample_patch3d) and model_mae.py (forward_loss, MaskedAutoencoderViT.forward).
+  coarse_to_fine=false reproduces the unweighted original MAE decoder head
+  exactly (verified bit-identical against the original smri_mae code).
+
+model: mae_vit_small
+
+model_kwargs:
+  coarse_to_fine: true
+  coarse_factor: 2
+  coarse_loss_weight: 1.0
+
+output_dir: checkpoints/experiments
+
+r2_sync: null
+
+# img_size doubles as the local_pt_dataset random-crop size. 160cube matches
+# the ResEncUNet-B/U-Net-B asparagus crop size and the sibling experiments,
+# so results stay comparable across all three. See the sibling experiments'
+# READMEs for the full data-quality writeup (~965/10 files kept despite many
+# being low-fill thin-slice scans -- img_mask already excludes padded/invalid
+# voxels from context and loss, so this isn't a correctness problem).
+img_size: [160, 160, 160]
+
+epochs: 250
+warmup_epochs: 25
+
+wandb: true
+wandb_entity: palinaskipar-zdro-tech
+wandb_project: smri-fm-coarse2fine
+
+# Same asparagus split (fold 0) as the sibling edgeloss/ToMe experiments, for
+# comparability.
+datasets:
+  fomo_train:
+    format: local_pt
+    paths: /workspace/fomo26/processed_data/PT902_FOMO300K_HF/split_99_01_00.json#train
+    shuffle: true
+    drop_last: true
+
+  fomo_val:
+    format: local_pt
+    paths: /workspace/fomo26/processed_data/PT902_FOMO300K_HF/split_99_01_00.json#val
+    shuffle: false
+    drop_last: false
+
+batch_size: 8
+accum_iter: 2
+num_workers: 4

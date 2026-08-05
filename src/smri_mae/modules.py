@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from einops import rearrange
+from einops import rearrange, reduce, repeat
 from jaxtyping import Float, Int
 from timm.layers import DropPath, to_3tuple
 
@@ -330,6 +330,102 @@ def unpatchify3d(
         q=p_w,
     )
     return x
+
+
+def avgpool_patch3d(
+    x: Tensor,
+    patch_size: tuple[int, int, int],
+    in_chans: int,
+    factor: int,
+) -> Tensor:
+    """Block-average a flattened patch (last dim, layout (c u p q)) down by
+    `factor` per spatial axis. Any number of leading batch dims. Used to
+    build the coarse ("big shape") reconstruction target from the same
+    fine-resolution target the detail head is scored against."""
+    u, p, q = patch_size
+    x = rearrange(x, "... (c u p q) -> ... c u p q", c=in_chans, u=u, p=p, q=q)
+    x = reduce(
+        x,
+        "... c (u f1) (p f2) (q f3) -> ... c u p q",
+        "mean",
+        f1=factor,
+        f2=factor,
+        f3=factor,
+    )
+    x = rearrange(x, "... c u p q -> ... (c u p q)")
+    return x
+
+
+def upsample_patch3d(
+    x: Tensor,
+    coarse_shape: tuple[int, int, int],
+    in_chans: int,
+    factor: int,
+) -> Tensor:
+    """Inverse of avgpool_patch3d: nearest-neighbor upsample a coarse,
+    flattened patch prediction back to full patch resolution."""
+    u, p, q = coarse_shape
+    x = rearrange(x, "... (c u p q) -> ... c u p q", c=in_chans, u=u, p=p, q=q)
+    x = repeat(
+        x,
+        "... c u p q -> ... c (u f1) (p f2) (q f3)",
+        f1=factor,
+        f2=factor,
+        f3=factor,
+    )
+    x = rearrange(x, "... c u p q -> ... (c u p q)")
+    return x
+
+
+class CoarseToFineHead(nn.Module):
+    """
+    Predicts each masked patch in two stages, mirroring how a human sketches
+    the overall shape before adding detail: `coarse_head` first guesses a
+    block-averaged (downsampled by `coarse_factor` per axis) version of the
+    patch, then `detail_head` predicts a fine residual on top of the
+    (upsampled) coarse guess. The two are summed into the final prediction.
+
+    Drop-in replacement for the plain nn.Linear decoder head used by the
+    original model -- same call signature, Tensor in, Tensor out at full
+    patch resolution -- so no other decoder/loss plumbing needs to know
+    about it. The coarse guess itself is cached on `last_coarse_pred` after
+    each forward() call so the training loop can also score it directly
+    against a coarse-pooled target (the "sketch the big shape first" part of
+    the loss, not just an emergent side effect of the residual sum).
+    """
+
+    def __init__(
+        self,
+        in_dim: int,
+        patch_size: tuple[int, int, int],
+        in_chans: int,
+        coarse_factor: int = 2,
+    ) -> None:
+        super().__init__()
+        if any(p % coarse_factor != 0 for p in patch_size):
+            raise ValueError(
+                f"patch_size {patch_size} must be divisible by coarse_factor {coarse_factor}"
+            )
+        self.in_chans = in_chans
+        self.patch_size = patch_size
+        self.coarse_factor = coarse_factor
+        self.coarse_shape = tuple(p // coarse_factor for p in patch_size)
+
+        patch_dim = in_chans * math.prod(patch_size)
+        coarse_dim = in_chans * math.prod(self.coarse_shape)
+
+        self.coarse_head = nn.Linear(in_dim, coarse_dim)
+        self.detail_head = nn.Linear(in_dim, patch_dim)
+        self.last_coarse_pred: Tensor | None = None
+
+    def extra_repr(self):
+        return f"patch_size={self.patch_size}, coarse_factor={self.coarse_factor}"
+
+    def forward(self, x: Tensor) -> Tensor:
+        coarse = self.coarse_head(x)
+        self.last_coarse_pred = coarse
+        upsampled = upsample_patch3d(coarse, self.coarse_shape, self.in_chans, self.coarse_factor)
+        return upsampled + self.detail_head(x)
 
 
 class AbsolutePosEmbed(nn.Module):
