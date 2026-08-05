@@ -96,9 +96,30 @@ def warn_and_continue(exn):
 
 
 def extract_sparse_wds_sample(sample: dict) -> dict:
+    image_values = np.asarray(sample["image_values.npy"], dtype=np.float16)
+    img_mask = np.asarray(sample["img_mask.npy"], dtype=np.uint8)
+
+    # img_mask is bit-packed (one bit per voxel); the number of set bits must
+    # match image_values' length, or densify_sparse_image_batch's boolean-mask
+    # assignment crashes downstream -- past the point where WebDataset's
+    # per-sample handler=warn_and_continue can catch it (that only wraps this
+    # extraction step, not later batch-level ops in the training loop). Some
+    # real samples in the dataset have a mismatched sparse encoding (seen in
+    # practice: vitl_rope_targetnorm_50k crashed on one at epoch 77 with a
+    # value tensor of shape [23765142] vs an indexing result of [23765018]);
+    # catching the mismatch here turns a fatal training crash into a graceful
+    # per-sample skip instead, same as any other malformed sample.
+    popcount = int(np.unpackbits(img_mask).sum())
+    if popcount != image_values.shape[0]:
+        raise ValueError(
+            f"sparse sample shape mismatch: img_mask has {popcount} set voxels "
+            f"but image_values has {image_values.shape[0]} values "
+            f"(meta={sample.get('meta.json')!r})"
+        )
+
     return {
-        "image_values": np.asarray(sample["image_values.npy"], dtype=np.float16),
-        "img_mask": np.asarray(sample["img_mask.npy"], dtype=np.uint8),
+        "image_values": image_values,
+        "img_mask": img_mask,
         "meta": sample["meta.json"],
     }
 
