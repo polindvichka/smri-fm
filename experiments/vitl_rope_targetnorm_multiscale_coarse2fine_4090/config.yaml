@@ -1,0 +1,100 @@
+# Overrides merged on top of src/smri_mae/config/default_pretrain.yaml
+# (main_pretrain.py --cfg-path). Stacks all four tricks that showed a real
+# (even if small, for two of them) improvement at the original 9k/4090
+# screen: RoPE (-33.0%), target norm (-3.4%), multiscale (-4.4%), and
+# coarse-to-fine (-2.4%). Everything else is identical to vitl_baseline_4090,
+# same as every other single-variable 9k/4090 run, so the comparison stays
+# fair against that same baseline.
+#
+# Why all four, given coarse2fine/multiscale turned out to be noise at 50k:
+# this run is itself a screen, same as the original 9k pass -- the question
+# here isn't "do these four help individually at scale" (already answered:
+# only rope and target_norm did), it's "do these four combine cleanly at
+# 9k without colliding," as a cheap first look before deciding whether a
+# 3-trick (rope+targetnorm+one of the other two) or 4-trick stack is worth
+# a 50k confirmation run at all. If this doesn't clearly beat the 2-trick
+# rope+targetnorm combo (measured -45.8% vs baseline at 9k, -21.9%* at 50k
+# once confirmed), that's a real answer too -- no need to chase a 4-way
+# stack further if adding multiscale/coarse2fine on top doesn't help or
+# actively hurts once RoPE + target norm are already doing the heavy
+# lifting. (*50k number pending -- see vitl_rope_targetnorm_50k.)
+#
+# Merge notes (all four branches merged cleanly, no logical conflicts --
+# see rope_targetnorm_multiscale_coarse2fine branch history for the actual
+# resolutions, all were either additive constructor params or genuinely
+# orthogonal code paths):
+# - RoPE touches attention internals (Q/K rotation) in both encoder and
+#   decoder; multiscale only changes what the encoder hands the decoder
+#   (fused blocks 7/15/23 instead of just the last); coarse-to-fine only
+#   changes the decoder's OUTPUT HEAD (two sub-heads instead of one linear
+#   layer). All three sit at different points in the forward pass and don't
+#   touch each other's code paths.
+# - target_norm only changes what the loss is computed against, not the
+#   model architecture at all -- orthogonal to all three of the above.
+# - The one real (non-mechanical) merge decision: forward_loss now tracks
+#   BOTH last_raw_mse (target_norm's fair, de-normalized, fine-only number)
+#   and last_fine_loss (coarse2fine's fair, non-coarse-term number) side by
+#   side, logged as both train/raw_mse and train/fine_loss. For THIS run
+#   specifically (target_norm AND coarse_to_fine both on), raw_mse is the
+#   one fully-fair number to compare against vitl_baseline_4090's plain
+#   loss -- it's de-normalized back to raw intensity scale AND excludes the
+#   coarse loss term, unlike fine_loss alone (still normalized-scale here)
+#   or the raw combined `loss` (normalized scale AND includes coarse term).
+#
+# batch_size/accum_iter: kept at vitl_baseline_4090's 12x5 (matching every
+# other single-variable 9k/4090 run, including vitl_rope_targetnorm_4090).
+# RoPE alone measured ~13% step time / ~6GB peak memory overhead; the
+# combined rope+targetnorm run measured 18.9GB peak at this same batch
+# size, comfortable headroom under a 24GB card. Multiscale and coarse2fine
+# both added no meaningful memory overhead in their own standalone 9k runs
+# (multiscale: no new params beyond one LayerNorm+Linear per tap; coarse2fine:
+# one extra small linear head). Stacking all four should still fit
+# comfortably, but this is an estimate, not a fourth real measurement --
+# worth a quick smoke test before the full run, same as every prior config.
+
+name: vitl_rope_targetnorm_multiscale_coarse2fine_4090
+notes: >
+  Stacks all four tricks that showed improvement at the original 9k/4090
+  screen -- RoPE, target norm, multiscale, coarse-to-fine -- applied
+  together on top of the same ViT-L / full-resolution / FOMO300+DWI
+  baseline recipe as vitl_baseline_4090. Tests whether they combine
+  cleanly or collide, as a cheap first look before deciding whether any
+  3- or 4-trick stack is worth a 50k confirmation run.
+
+model_kwargs:
+  use_rope: true
+  target_norm: patch
+  multiscale_layers: [7, 15, 23]
+  coarse_to_fine: true
+  coarse_factor: 2
+  coarse_loss_weight: 1.0
+
+output_dir: checkpoints/experiments
+
+batch_size: 12
+accum_iter: 5
+
+datasets:
+  fomo_train:
+    # Same 9k/60-shard local cache and shard range as every other 9k/4090
+    # run -- 9000 samples/epoch, 150 steps/epoch x 100 epochs = 15000 steps
+    # total.
+    url: /workspace/data/fomo_dwi_subset/train/shard.{000000..000059}.tar
+    samples_per_epoch: 9000
+    shuffle: true
+    buffer_size: 8000
+    drop_last: true
+
+  fomo_val:
+    url: /workspace/data/fomo_dwi_subset/val/shard.{001621..001626}.tar
+    samples_per_epoch: 900
+    shuffle: false
+    buffer_size: 900
+    drop_last: false
+
+checkpoint_period: 20
+max_checkpoints: 1
+
+wandb: true
+wandb_entity: palinaskipar-zdro-tech
+wandb_project: smri-fm-vitl-baseline-4090
