@@ -1,2 +1,2 @@
-v0.74.0
-c49bb7625e6a495337483353a5228339fece2c11
+v0.75.0 + vendored patch (see tenstorrent/patches/vendored-tt-metal-changes.patch)
+7675993fdfdc161b2fe0a5fe8cdfe5b0e87d12b7

@@ -7,7 +7,9 @@
 #
 # What this does:
 #   1. Clones tenstorrent/tt-metal into tenstorrent/tt-metal (gitignored;
-#      pinned commit recorded in tenstorrent/tt-metal.commit) if not present.
+#      pinned commit recorded in tenstorrent/tt-metal.commit) if not present,
+#      pins v0.75.0, then applies tenstorrent/patches/vendored-tt-metal-changes.patch
+#      (TENSTORRENT_PORT.md section 7's vendored SDPA changes).
 #   2. sudo ./install_dependencies.sh -- apt packages, LLVM 20, SFPI, OpenMPI
 #      ULFM, CMake. Modifies host system state (this is the one host-invasive
 #      step; everything else is scoped to the tt-metal checkout).
@@ -31,14 +33,35 @@ if [ ! -d "$TT_METAL_DIR/.git" ]; then
     git clone https://github.com/tenstorrent/tt-metal.git \
         --recurse-submodules --shallow-submodules --depth 1 "$TT_METAL_DIR"
 fi
-# Pin to v0.74.0 for reproducibility, both on a fresh clone and when re-run
-# against an existing checkout.
-git -C "$TT_METAL_DIR" fetch --depth 1 origin tag v0.74.0
-git -C "$TT_METAL_DIR" checkout v0.74.0
+# Pin to v0.75.0 for reproducibility, both on a fresh clone and when re-run
+# against an existing checkout (bumped from v0.74.0, 2026-08-05 stability
+# pass -- see TENSTORRENT_PORT.md section 1).
+git -C "$TT_METAL_DIR" fetch --depth 1 origin tag v0.75.0
+git -C "$TT_METAL_DIR" checkout v0.75.0
 git -C "$TT_METAL_DIR" submodule sync --recursive
 git -C "$TT_METAL_DIR" submodule update --init --recursive --depth 1
+
+# Apply this project's vendored tt-train changes on top of the bare v0.75.0
+# tag (TENSTORRENT_PORT.md section 7): AttentionMaskType::None (bidirectional)
+# support through the ops-layer wrapper + nanobind binding (M0 fix, required
+# for this model), and B17's sfpu_reduce row-sum fusion in the SDPA backward
+# kernel (kept from the M6 search, no hang history). Idempotent: skipped if
+# already applied (re-running setup.sh against an existing checkout).
+PATCH="$ROOT/patches/vendored-tt-metal-changes.patch"
+if git -C "$TT_METAL_DIR" apply --check "$PATCH" 2>/dev/null; then
+    git -C "$TT_METAL_DIR" apply "$PATCH"
+    echo "  applied $PATCH"
+elif git -C "$TT_METAL_DIR" apply --reverse --check "$PATCH" 2>/dev/null; then
+    echo "  $PATCH already applied, skipping"
+else
+    echo "  ERROR: $PATCH does not apply cleanly to v0.75.0 -- tt-metal checkout" \
+         "or the patch is out of sync, needs manual reconciliation" >&2
+    exit 1
+fi
+
 git -C "$TT_METAL_DIR" rev-parse HEAD > "$ROOT/tt-metal.commit"
-echo "  pinned at $(cat "$ROOT/tt-metal.commit")"
+echo "v0.75.0 + vendored patch (uncommitted working-tree diff, see $PATCH)" >> "$ROOT/tt-metal.commit"
+echo "  pinned at $(head -1 "$ROOT/tt-metal.commit")"
 
 echo "[2/5] install_dependencies.sh (sudo, modifies host packages)"
 sudo "$TT_METAL_DIR/install_dependencies.sh"
